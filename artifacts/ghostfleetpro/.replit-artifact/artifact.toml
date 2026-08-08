@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/ghostfleetpro/"
+title = "Ghost Fleet Pro"
+description = "An imported Discord bot management dashboard for monitoring accounts, automating responses, managing rules, and reviewing activity history."
+version = "1.0.0"
+id = "artifacts/ghostfleetpro"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/ghostfleetpro/" ]
+localPort = 24661
+
+[services.development]
+run = "pnpm --filter @workspace/ghostfleetpro run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/ghostfleetpro", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/ghostfleetpro/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24661"
+BASE_PATH = "/ghostfleetpro/"

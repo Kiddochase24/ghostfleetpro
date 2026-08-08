@@ -1,0 +1,154 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Oxanium:wght@300;400;500;600;700;800&family=Rajdhani:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+
+@theme {
+  --font-sans: 'Rajdhani', sans-serif;
+  --font-display: 'Oxanium', sans-serif;
+  --font-mono: 'Space Grotesk', monospace;
+
+  --color-background: hsl(160, 50%, 2%);
+  --color-foreground: hsl(160, 20%, 90%);
+  --color-primary: hsl(160, 84%, 39%);
+  --color-primary-foreground: hsl(0, 0%, 0%);
+  --color-card: hsl(160, 40%, 4%);
+  --color-card-foreground: hsl(160, 20%, 90%);
+  --color-border: hsl(160, 50%, 15%);
+  --color-input: hsl(160, 50%, 15%);
+  --color-ring: hsl(160, 84%, 39%);
+  --color-destructive: hsl(0, 84%, 60%);
+  --color-destructive-foreground: hsl(0, 0%, 100%);
+  --color-muted: hsl(160, 20%, 10%);
+  --color-muted-foreground: hsl(160, 10%, 50%);
+  --color-accent: hsl(160, 60%, 20%);
+  --color-accent-foreground: hsl(160, 80%, 80%);
+  --color-popover: hsl(160, 40%, 4%);
+  --color-popover-foreground: hsl(160, 20%, 90%);
+  --color-secondary: hsl(160, 30%, 8%);
+  --color-secondary-foreground: hsl(160, 20%, 70%);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  border-color: hsl(160, 50%, 15%);
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: hsl(160, 50%, 2%);
+  color: hsl(160, 20%, 90%);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-image:
+    radial-gradient(circle at 15% 50%, rgba(16, 185, 129, 0.08), transparent 40%),
+    radial-gradient(circle at 85% 30%, rgba(16, 185, 129, 0.05), transparent 40%),
+    linear-gradient(to bottom, transparent, rgba(16, 185, 129, 0.02));
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-display);
+  letter-spacing: 0.05em;
+  color: hsl(160, 20%, 95%);
+  text-shadow: 0 0 15px rgba(16, 185, 129, 0.3);
+}
+
+::selection {
+  background: rgba(16, 185, 129, 0.3);
+  color: hsl(160, 80%, 80%);
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.3); }
+::-webkit-scrollbar-thumb { background: rgba(16, 185, 129, 0.2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(16, 185, 129, 0.5); }
+
+/* Utility Classes */
+.glass-panel {
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5), inset 0 0 20px rgba(16, 185, 129, 0.05);
+}
+
+.glass-panel-hover {
+  transition: all 0.5s ease;
+}
+.glass-panel-hover:hover {
+  border-color: rgba(16, 185, 129, 0.5);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5), inset 0 0 20px rgba(16, 185, 129, 0.1), 0 0 20px rgba(16, 185, 129, 0.2);
+}
+
+.cyber-gradient-text {
+  background: linear-gradient(to right, #6ee7b7, #34d399, #059669);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.neon-glow {
+  box-shadow: 0 0 15px rgba(16, 185, 129, 0.4), 0 0 30px rgba(16, 185, 129, 0.2);
+}
+
+.neon-border {
+  border: 1px solid rgba(16, 185, 129, 0.5);
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.3), inset 0 0 10px rgba(16, 185, 129, 0.1);
+}
+
+/* Animated gradient border */
+.cyber-border {
+  position: relative;
+}
+.cyber-border::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  background: linear-gradient(45deg, rgba(16,185,129,0.5), transparent, rgba(16,185,129,0.5));
+  border-radius: inherit;
+  z-index: -1;
+  animation: borderRotate 3s linear infinite;
+}
+
+@keyframes borderRotate {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* Online pulse dot */
+.status-dot-online {
+  background: #10b981;
+  box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+  animation: pulse-online 2s infinite;
+}
+@keyframes pulse-online {
+  0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+  70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+/* Terminal blink */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.blink { animation: blink 1s step-end infinite; }
+
+/* Scan line effect */
+.scanlines::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.03) 2px,
+    rgba(0, 0, 0, 0.03) 4px
+  );
+  pointer-events: none;
+}
