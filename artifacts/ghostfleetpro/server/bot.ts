@@ -724,6 +724,48 @@ function invalidateRosterCache(guildId: string): void {
   }
 }
 
+// An account is only allowed to own a roster slot or send a reply when both
+// persistence and the live gateway agree that it is usable.  Checking the
+// gateway session is important because the account document can remain
+// "Connected" for the duration of a reconnect backoff.
+async function isAccountReplyReady(
+  accountId: string,
+  guildId?: string,
+): Promise<boolean> {
+  const session = sessions.get(accountId);
+  if (
+    !session ||
+    gatewayStatus.get(accountId) !== "ready" ||
+    !session.isReady
+  ) {
+    return false;
+  }
+  if (guildId && !session.guildIds.includes(guildId)) return false;
+
+  try {
+    const account = await storage.getAccount(accountId);
+    return !!account && account.status === "Connected" && !!account.token;
+  } catch {
+    return false;
+  }
+}
+
+async function recomputeAccountRotations(accountId: string): Promise<void> {
+  try {
+    const roster = await storage.getRosterByAccount(accountId);
+    const guildIds = new Set(
+      roster
+        .filter((entry) => entry.status === "active" || entry.status === "queued")
+        .map((entry) => entry.guildId),
+    );
+    for (const guildId of guildIds) {
+      await recomputeRotation(guildId);
+    }
+  } catch (e: any) {
+    logFn(`ROSTER ROTATION ERR [${accountId}]: ${e.message}`);
+  }
+}
+
 // Recompute active/queued status for every roster row of a single guild: the
 // earliest joinedAt among eligible rows becomes "active", the rest "queued".
 export async function recomputeRotation(guildId: string): Promise<void> {
@@ -737,24 +779,46 @@ export async function recomputeRotation(guildId: string): Promise<void> {
     .toArray();
   if (eligible.length === 0) return;
 
-  const primary = eligible[0];
+  const accounts = await storage.getAccounts();
+  const accountStatus = new Map(accounts.map((account) => [account.id, account]));
+  const healthy = eligible.filter((row) => {
+    const account = accountStatus.get(row.accountId);
+    const session = sessions.get(row.accountId);
+    return (
+      account?.status === "Connected" &&
+      !!account.token &&
+      !!session &&
+      gatewayStatus.get(row.accountId) === "ready" &&
+      session.isReady &&
+      session.guildIds.includes(guildId)
+    );
+  });
+  const primary = healthy[0];
   const ops: Promise<any>[] = [];
-  if (primary.status !== "active") {
-    ops.push(db.collection("server_roster").updateOne({ _id: primary._id }, { $set: { status: "active" } }));
-  }
-  for (const row of eligible.slice(1)) {
-    if (row.status !== "queued") {
-      ops.push(db.collection("server_roster").updateOne({ _id: row._id }, { $set: { status: "queued" } }));
+  for (const row of eligible) {
+    const desiredStatus =
+      primary && row._id?.toString() === primary._id?.toString()
+        ? "active"
+        : "queued";
+    if (row.status !== desiredStatus) {
+      ops.push(
+        db.collection("server_roster").updateOne(
+          { _id: row._id },
+          { $set: { status: desiredStatus } },
+        ),
+      );
     }
   }
   if (ops.length > 0) await Promise.all(ops);
+
+  if (!primary) return;
 
   broadcastFn("rosterRotation", {
     guildId,
     guildName: primary.guildName,
     activeAccountId: primary.accountId,
     activeAccountName: primary.accountName,
-    queueSize: eligible.length,
+    queueSize: healthy.length,
   });
 }
 
@@ -1112,6 +1176,9 @@ function openSession(accountId: string, accountName: string, token: string) {
     gatewayStatus.set(accountId, "dead");
     broadcastFn("gatewayStatus", { accountId, status: "dead", accountName });
     broadcastGatewayHealth();
+    // Remove this account from primary ownership immediately. The database
+    // status can still be Connected while a reconnect is backing off.
+    recomputeAccountRotations(accountId).catch(() => {});
 
     const fatal = [4004, 4010, 4011, 4012, 4013, 4014];
     if (!fatal.includes(code)) {
@@ -1178,6 +1245,9 @@ function closeSession(accountId: string) {
   } catch {}
   sessions.delete(accountId);
   gatewayStatus.delete(accountId);
+  // This path is also used when the DB account is manually disconnected, so
+  // do not wait for the websocket close event to release roster ownership.
+  recomputeAccountRotations(accountId).catch(() => {});
 }
 
 function clearTimers(s: GatewaySession) {
@@ -1393,6 +1463,9 @@ async function onDispatch(type: string, d: any, s: GatewaySession) {
       s.guildIds = (d.guilds || []).map((g: any) => g.id);
       s.discordUserId = d.user?.id ?? null;
       gatewayStatus.set(s.accountId, "ready");
+      // A READY event can make a previously queued account eligible, and can
+      // also replace a dead account that was holding the active slot.
+      recomputeAccountRotations(s.accountId).catch(() => {});
 
       // Clean connection — reset backoff counter and clear any stale resume data
       retryCount.delete(s.accountId);
@@ -1755,6 +1828,7 @@ async function onDispatch(type: string, d: any, s: GatewaySession) {
       s.isResumed = true;
       s.connectReadyAt = Date.now() - 300_000; // Mark as past warm-up window
       gatewayStatus.set(s.accountId, "ready");
+      recomputeAccountRotations(s.accountId).catch(() => {});
       broadcastFn("gatewayStatus", {
         accountId: s.accountId,
         accountName: s.accountName,
@@ -1988,16 +2062,6 @@ async function onMessage(msg: any, s: GatewaySession) {
       }
     }
 
-    // ── Dedup: skip if this exact message+rule already fired in this process ──
-    // Catches duplicates from overlapping deployments, double-added tokens,
-    // or Discord RESUME replays.
-    if (msg.id && (await alreadyFired(msg.id, rule.id))) {
-      logFn(
-        `DEDUP [${rule.label}]: msg ${msg.id} already fired — skipping duplicate`,
-      );
-      continue;
-    }
-
     // ── Admin Guard — skip if any admin with the watched role is online ─────
     if (rule.adminGuardEnabled && rule.adminRoleId && guildId) {
       if (isAdminOnline(s, guildId, rule.adminRoleId)) {
@@ -2041,6 +2105,36 @@ async function onMessage(msg: any, s: GatewaySession) {
         if (!liveRule || !liveRule.isActive) {
           logFn(
             `SKIPPED [${ruleLabel}]: rule was paused or deleted before send`,
+          );
+          return;
+        }
+
+        // The active account or its gateway may have changed while this reply
+        // was waiting in the channel queue. Recompute before sending so a
+        // stale active row cannot silence the healthy queued account.
+        if (guildId) {
+          const rosterStatus = await getRosterStatus(s.accountId, guildId);
+          const ready = await isAccountReplyReady(s.accountId, guildId);
+          if (rosterStatus !== "active" || !ready) {
+            await recomputeRotation(guildId).catch(() => {});
+            logFn(
+              `SKIPPED [${ruleLabel}]: ${s.accountName} lost active/ready roster ownership before send`,
+            );
+            return;
+          }
+        } else if (!(await isAccountReplyReady(s.accountId))) {
+          logFn(`SKIPPED [${ruleLabel}]: ${s.accountName} gateway is not ready before send`);
+          return;
+        }
+
+        // Claim only after all rule, roster, and admin gates pass, and only
+        // inside the serialized send callback. A second account/process cannot
+        // send the same message while this one is waiting on the delay.
+        const messageClaimed =
+          msg.id ? await alreadyFired(msg.id, ruleId) : false;
+        if (messageClaimed) {
+          logFn(
+            `DEDUP [${ruleLabel}]: message already claimed — skipping duplicate`,
           );
           return;
         }
@@ -2108,6 +2202,18 @@ async function onMessage(msg: any, s: GatewaySession) {
             ? s.guildNames.get(guildId) || guildId
             : "Unknown";
 
+          // A REST 401 means the token is no longer usable even if the
+          // gateway has not delivered its fatal close yet. Release this
+          // account's roster ownership immediately so queued accounts can
+          // take over. A 403 is intentionally not treated the same way:
+          // it is normally a channel permission problem, not a dead token.
+          if (sendResult.status === 401) {
+            await storage.updateAccountStatus(s.accountId, "Disconnected").catch(() => {});
+            await recomputeAccountRotations(s.accountId).catch(() => {});
+          } else if (gatewayStatus.get(s.accountId) !== "ready") {
+            await recomputeAccountRotations(s.accountId).catch(() => {});
+          }
+
           // Track 403s — blacklist after 3 consecutive failures on same channel
           if (sendResult.status === 403) {
             record403(s.accountId, channelId, s.accountName, channelName, guildName);
@@ -2144,6 +2250,38 @@ async function onMessage(msg: any, s: GatewaySession) {
         const sentMsg = await sendResult.json().catch(() => null);
         const sentMsgId = sentMsg?.id;
 
+        const resolvedChanName = await resolveChannelName(channelId, s);
+        const resolvedSrvName =
+          srvInfo?.name || s.guildNames.get(guildId || "") || guildId || "DM";
+
+        // Notify immediately after Discord accepts the reply. This prevents a
+        // later history/broadcast failure from hiding a real successful reply
+        // from Telegram.
+        if (
+          liveRule.telegramEnabled &&
+          liveRule.telegramToken &&
+          liveRule.telegramChatId
+        ) {
+          const aiScoreLine =
+            rule.triggerCondition === "keyword"
+              ? `AI Score: ${aiConfidence}% (crypto) | ${aiGeneralConfidence}% (general) ✅\nAI Reason: ${aiReasoning}\n`
+              : "";
+          const tgMsg =
+            `🤖 Ghost Fleet Auto-Reply\n\n` +
+            `Rule: ${ruleLabel}\n` +
+            `Profile: ${s.accountName}\n` +
+            `${aiScoreLine}` +
+            `Server: ${resolvedSrvName}\n` +
+            `Channel: #${resolvedChanName}\n` +
+            `Triggered by: @${msg.author?.username}\n` +
+            `Message: "${triggerContent.substring(0, 80)}"\n` +
+            `Delay: ${delayMs}ms`;
+          await sendTelegram(
+            liveRule.telegramToken,
+            liveRule.telegramChatId,
+            tgMsg,
+          );
+        }
 
         // Schedule auto-delete of the sent message if deleteDelayMs is set
         const deleteDelayMs = (liveRule as any).deleteDelayMs ?? 0;
@@ -2167,10 +2305,6 @@ async function onMessage(msg: any, s: GatewaySession) {
         }
 
         await storage.incrementRuleResponseCount(ruleId);
-
-        const resolvedChanName = await resolveChannelName(channelId, s);
-        const resolvedSrvName =
-          srvInfo?.name || s.guildNames.get(guildId || "") || guildId || "DM";
 
         await storage.createHistory({
           workspaceId: liveRule.workspaceId ?? undefined,
@@ -2197,32 +2331,6 @@ async function onMessage(msg: any, s: GatewaySession) {
           delay: delayMs,
         });
 
-        // Telegram notification
-        if (
-          liveRule.telegramEnabled &&
-          liveRule.telegramToken &&
-          liveRule.telegramChatId
-        ) {
-          const aiScoreLine =
-            rule.triggerCondition === "keyword"
-              ? `AI Score: ${aiConfidence}% (crypto) | ${aiGeneralConfidence}% (general) ✅\nAI Reason: ${aiReasoning}\n`
-              : "";
-          const tgMsg =
-            `🤖 Ghost Fleet Auto-Reply\n\n` +
-            `Rule: ${ruleLabel}\n` +
-            `Profile: ${s.accountName}\n` +
-            `${aiScoreLine}` +
-            `Server: ${resolvedSrvName}\n` +
-            `Channel: #${resolvedChanName}\n` +
-            `Triggered by: @${msg.author?.username}\n` +
-            `Message: "${triggerContent.substring(0, 80)}"\n` +
-            `Delay: ${delayMs}ms`;
-          await sendTelegram(
-            liveRule.telegramToken,
-            liveRule.telegramChatId,
-            tgMsg,
-          );
-        }
       } catch (e: any) {
         logFn(`AUTO-REPLY ERR [${ruleLabel}]: ${e.message}`);
         // Rate-limited Telegram error alert — max 1 per channel per hour
@@ -2524,13 +2632,33 @@ async function resolveChannelName(
 
 async function sendTelegram(botToken: string, chatId: string, text: string) {
   try {
-    await fetch(`${TELEGRAM_API}/bot${botToken}/sendMessage`, {
+    const response = await fetch(`${TELEGRAM_API}/bot${botToken}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+      // The notification text contains user/rule content. Do not request
+      // HTML parsing: an unescaped "<" or "&" makes Telegram reject the
+      // entire notification, which previously happened silently.
+      body: JSON.stringify({ chat_id: chatId, text }),
     });
+    const responseText = await response.text();
+    if (!response.ok) {
+      logFn(
+        `TELEGRAM FAILED: HTTP ${response.status} — ${responseText.substring(0, 300)}`,
+      );
+      return false;
+    }
+    let result: any = null;
+    try {
+      result = JSON.parse(responseText);
+    } catch {}
+    if (result && result.ok === false) {
+      logFn(`TELEGRAM FAILED: ${String(result.description || "API rejected message").substring(0, 300)}`);
+      return false;
+    }
+    return true;
   } catch (e: any) {
     logFn(`TELEGRAM ERR: ${e.message}`);
+    return false;
   }
 }
 

@@ -1,0 +1,1 @@
+- [Ghost Fleet reply ownership](ghostfleet-reply-ownership.md) — roster promotion must require persisted account health and a live ready gateway session.
