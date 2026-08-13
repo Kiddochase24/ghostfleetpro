@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { getDeviceFingerprint, getCachedLicenseState, setCachedLicenseState } from "@/lib/device";
 import { Shield, KeyRound, Loader2, CheckCircle2, Lock, Zap } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import { appUrl } from "@/lib/queryClient";
 
 type State = "checking" | "locked" | "unlocked" | "activating" | "error";
 
@@ -20,7 +21,7 @@ export function LicenseGate({ children }: { children: React.ReactNode }) {
       if (getCachedLicenseState()) {
         setState("unlocked");
         // Silently verify in background
-        fetch("/api/license/check", {
+          fetch(appUrl("/api/license/check"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ fingerprint: fp }),
@@ -40,7 +41,7 @@ export function LicenseGate({ children }: { children: React.ReactNode }) {
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 8000);
-        const res = await fetch("/api/license/check", {
+        const res = await fetch(appUrl("/api/license/check"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ fingerprint: fp }),
@@ -68,7 +69,7 @@ export function LicenseGate({ children }: { children: React.ReactNode }) {
     setError("");
 
     try {
-      const res = await fetch("/api/license/activate", {
+      const res = await fetch(appUrl("/api/license/activate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: trimmed, fingerprint }),

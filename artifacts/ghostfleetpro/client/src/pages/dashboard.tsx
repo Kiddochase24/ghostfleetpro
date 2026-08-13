@@ -140,7 +140,8 @@ export default function Dashboard() {
 
     const connect = () => {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      const base = (import.meta.env.BASE_URL || "/").replace(/\/+$/, "");
+      const ws = new WebSocket(`${protocol}//${window.location.host}${base}/ws`);
       wsRef.current = ws;
       setWsStatus("connecting");
 

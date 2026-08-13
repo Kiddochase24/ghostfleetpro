@@ -34,6 +34,20 @@ app.use(
 
 app.use(express.urlencoded({ extended: false }));
 
+// The Replit artifact proxy forwards the preview prefix to this service
+// (for example /ghostfleetpro/api/...); Express routes are registered at
+// /api/... internally. Strip only the configured artifact prefix so both
+// proxied artifact traffic and root PM2 deployments work.
+const basePath = (process.env.BASE_PATH || "/").replace(/\/+$/, "") || "/";
+if (basePath !== "/") {
+  app.use((req, _res, next) => {
+    if (req.url === basePath || req.url.startsWith(`${basePath}/`)) {
+      req.url = req.url.slice(basePath.length) || "/";
+    }
+    next();
+  });
+}
+
 if (process.env.NODE_ENV !== "production") {
   app.use((_req, res, next) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");

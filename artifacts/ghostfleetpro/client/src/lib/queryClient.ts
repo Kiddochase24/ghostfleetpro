@@ -3,12 +3,6 @@ import { QueryClient, QueryFunction } from "@tanstack/react-query";
 export function appUrl(path: string): string {
   const base = (import.meta.env.BASE_URL || "/").replace(/\/+$/, "");
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  // The full-stack Ghost Fleet service owns the root API and WebSocket routes.
-  // Only client page/assets need the artifact's preview prefix.
-  if (normalizedPath === "/api" || normalizedPath.startsWith("/api/") ||
-      normalizedPath === "/ws" || normalizedPath.startsWith("/ws/")) {
-    return normalizedPath;
-  }
   return `${base}${normalizedPath}`;
 }
 

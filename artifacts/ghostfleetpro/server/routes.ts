@@ -152,7 +152,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   setInterval(runHistoryPurge, 24 * 60 * 60 * 1000);
 
   // === WEBSOCKET ===
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const wsPath = `${(process.env.BASE_PATH || "/").replace(/\/+$/, "")}/ws` || "/ws";
+  const wss = new WebSocketServer({ server: httpServer, path: wsPath });
   wss.on("connection", (ws) => {
     wsClients.add(ws);
     (ws as any).isAlive = true;

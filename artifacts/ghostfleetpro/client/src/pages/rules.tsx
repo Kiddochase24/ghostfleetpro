@@ -16,7 +16,7 @@ type Account = {
   username?: string;
   avatar?: string;
   status?: string;
-  guilds?: { id: string; name?: string | null; icon: string | null }[];
+  guilds?: { id: string; name?: string | null; icon?: string | null }[];
 };
 type Channel = { id: string; name: string; type: number };
 type Rule = {
@@ -67,10 +67,51 @@ const STEP_ADVANCED = 6;
 type ProfileCfg = { selectedServers: {id:string;name:string}[]; selectedChannels: {id:string;name:string;serverId:string}[]; allChannels: boolean };
 
 const accountLabel = (account: Account) =>
-  account.name?.trim() || account.username?.trim() || account.id || "Unnamed account";
+  (typeof account.name === "string" ? account.name.trim() : "") ||
+  (typeof account.username === "string" ? account.username.trim() : "") ||
+  account.id ||
+  "Unnamed account";
 
-const guildLabel = (guild: { id: string; name?: string | null }) =>
-  guild.name?.trim() || guild.id || "Unnamed server";
+const guildLabel = (guild: { id: string; name?: string | null } | null | undefined) =>
+  (typeof guild?.name === "string" ? guild.name.trim() : "") ||
+  guild?.id ||
+  "Unnamed server";
+
+function normalizeAccount(value: unknown): Account | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const id = typeof record.id === "string" || typeof record.id === "number"
+    ? String(record.id)
+    : "";
+  if (!id) return null;
+
+  const normalizeText = (field: unknown) =>
+    typeof field === "string" ? field : field == null ? field : String(field);
+  const guilds = Array.isArray(record.guilds)
+    ? record.guilds.flatMap(value => {
+        if (!value || typeof value !== "object") return [];
+        const guild = value as Record<string, unknown>;
+        const guildId = typeof guild.id === "string" || typeof guild.id === "number"
+          ? String(guild.id)
+          : "";
+        if (!guildId) return [];
+        return [{
+          id: guildId,
+          name: normalizeText(guild.name),
+          icon: normalizeText(guild.icon) as string | null | undefined,
+        }];
+      })
+    : [];
+
+  return {
+    id,
+    name: normalizeText(record.name),
+    username: normalizeText(record.username) || undefined,
+    avatar: normalizeText(record.avatar) || undefined,
+    status: normalizeText(record.status) || undefined,
+    guilds,
+  };
+}
 
 const BLANK_FORM = {
   label: "", triggerCondition: "keyword", keyword: "",
@@ -101,8 +142,10 @@ export default function Rules() {
   const serverItemRefs = useRef<Record<string, HTMLButtonElement | null>>({});
 
   const { data: rules = [], isLoading } = useQuery<Rule[]>({ queryKey: ["/api/rules"], refetchInterval: 10000 });
-  const { data: rawAccounts = [] } = useQuery<Account[]>({ queryKey: ["/api/accounts"] });
-  const accounts = Array.isArray(rawAccounts) ? rawAccounts : [];
+  const { data: rawAccounts = [] } = useQuery<unknown>({ queryKey: ["/api/accounts"] });
+  const accounts = (Array.isArray(rawAccounts) ? rawAccounts : [])
+    .map(normalizeAccount)
+    .filter((account): account is Account => account !== null);
 
   const createMutation = useMutation({
     mutationFn: (data: any) => apiRequest("POST", "/api/rules", data).then(r => r.json()),
