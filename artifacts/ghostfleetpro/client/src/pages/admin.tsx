@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   Shield, Key, Plus, Trash2, Copy, Check, RefreshCw, Lock, LogOut,
   Loader2, Tag, Server, Users, ArrowRight, RotateCcw, XCircle, Ban,
+  CheckCircle2, CircleDot,
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -22,6 +23,16 @@ interface RosterEntry {
   workspaceId: number | null;
   joinedAt: string;
   status: "active" | "queued" | "kicked" | "banned" | "left";
+  primaryRequested?: boolean;
+  health?: {
+    accountStatus: string;
+    gatewayReady: boolean;
+    inServer: boolean;
+    tokenValid: boolean | null;
+    tokenCheckedAt: string | null;
+    healthy: boolean;
+    reason: string;
+  };
 }
 
 interface ServerSummary {
@@ -129,8 +140,28 @@ function LicenseRow({ lic, adminKey, onRevoke, onCopy }: {
 
 // ─── Roster Server Card ───────────────────────────────────────────────────────
 
-function RosterCard({ server }: { server: ServerSummary }) {
+function HealthCheck({ label, ok, pending = false }: { label: string; ok: boolean; pending?: boolean }) {
+  const color = pending ? "#fbbf24" : ok ? "#34d399" : "#f87171";
+  return (
+    <span className="inline-flex items-center gap-1 text-[10px] font-display"
+      style={{ color }} title={`${label}: ${pending ? "checking" : ok ? "pass" : "fail"}`}>
+      {pending ? <Loader2 className="w-3 h-3 animate-spin" /> : ok ? <CheckCircle2 className="w-3 h-3" /> : <CircleDot className="w-3 h-3" />}
+      {label}
+    </span>
+  );
+}
+
+function RosterCard({
+  server,
+  adminKey,
+  onPrimary,
+}: {
+  server: ServerSummary;
+  adminKey: string;
+  onPrimary: () => void;
+}) {
   const [expanded, setExpanded] = useState(false);
+  const [promotingId, setPromotingId] = useState<string | null>(null);
   const coverage = server.total > 0 ? Math.round((server.active / server.total) * 100) : 0;
 
   return (
@@ -188,7 +219,7 @@ function RosterCard({ server }: { server: ServerSummary }) {
                   Rotation Queue — ordered by rule-activation time (global)
                 </span>
               </div>
-              {server.entries.length === 0 ? (
+               {server.entries.length === 0 ? (
                 <div className="flex items-center gap-2 px-3 py-3 rounded-lg"
                   style={{ background: "rgba(239,68,68,0.04)", border: "1px solid rgba(239,68,68,0.1)" }}>
                   <XCircle className="w-4 h-4 flex-shrink-0" style={{ color: "rgba(239,68,68,0.5)" }} />
@@ -197,16 +228,17 @@ function RosterCard({ server }: { server: ServerSummary }) {
                     Accounts will appear here once they connect to Discord and their guild list is refreshed.
                   </span>
                 </div>
-              ) : server.entries.map((entry, idx) => {
+               ) : server.entries.map((entry, idx) => {
                 const st = STATUS_STYLE[entry.status] || STATUS_STYLE.left;
-                const isFirst = idx === 0;
-                const isPrimary = entry.status === "active" && server.entries.filter(e => e.status === "active").indexOf(entry) === 0;
+                 const isPrimary = entry.status === "active";
+                 const health = entry.health;
+                 const canPromote = entry.status === "queued" && health?.healthy === true;
                 return (
                   <div key={entry.accountId} className="flex items-center gap-3 px-3 py-2 rounded-lg"
                     style={{ background: isPrimary ? "rgba(16,185,129,0.05)" : "rgba(0,0,0,0.2)", border: `1px solid ${isPrimary ? "rgba(16,185,129,0.15)" : "rgba(255,255,255,0.04)"}` }}>
                     {/* Position badge */}
                     <div className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0 text-xs font-mono font-bold"
-                      style={{ background: isFirst ? "rgba(16,185,129,0.15)" : "rgba(255,255,255,0.05)", color: isFirst ? "#34d399" : "rgba(255,255,255,0.3)" }}>
+                       style={{ background: isPrimary ? "rgba(16,185,129,0.15)" : "rgba(255,255,255,0.05)", color: isPrimary ? "#34d399" : "rgba(255,255,255,0.3)" }}>
                       {idx + 1}
                     </div>
                     <div className="flex-1 min-w-0">
@@ -218,13 +250,30 @@ function RosterCard({ server }: { server: ServerSummary }) {
                             PRIMARY
                           </span>
                         )}
+                         {entry.primaryRequested && !isPrimary && (
+                           <span className="text-[10px] px-1.5 py-0.5 rounded font-display"
+                             style={{ background: "rgba(251,191,36,0.1)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.2)" }}>
+                             PREFERRED
+                           </span>
+                         )}
                         {entry.workspaceId && (
                           <span className="text-xs font-mono" style={{ color: "rgba(255,255,255,0.2)" }}>ws#{entry.workspaceId}</span>
                         )}
                       </div>
-                      <div className="text-xs mt-0.5" style={{ color: "rgba(255,255,255,0.3)" }}>
+                       <div className="text-xs mt-0.5" style={{ color: "rgba(255,255,255,0.3)" }}>
                         Joined {timeAgo(entry.joinedAt)} · {new Date(entry.joinedAt).toLocaleDateString()}
                       </div>
+                       <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                         <HealthCheck label="Account" ok={health?.accountStatus === "Connected"} pending={!health} />
+                         <HealthCheck label="Gateway" ok={health?.gatewayReady === true} pending={!health} />
+                         <HealthCheck label="Server" ok={health?.inServer === true} pending={!health} />
+                         <HealthCheck label="Token" ok={health?.tokenValid === true} pending={!health || health.tokenValid === null} />
+                         {health && !health.healthy && (
+                           <span className="text-[10px] truncate max-w-44" style={{ color: "#f87171" }} title={health.reason}>
+                             {health.reason}
+                           </span>
+                         )}
+                       </div>
                     </div>
                     {/* Status */}
                     <div className="flex items-center gap-1.5 flex-shrink-0">
@@ -234,6 +283,34 @@ function RosterCard({ server }: { server: ServerSummary }) {
                         style={{ background: st.bg, color: st.color, border: `1px solid ${st.border}` }}>
                         {st.label}
                       </span>
+                       {canPromote && (
+                         <button
+                           onClick={async (event) => {
+                             event.stopPropagation();
+                             setPromotingId(entry.accountId);
+                             try {
+                               const response = await fetch(`/api/admin/server-roster/${server.guildId}/primary`, {
+                                 method: "POST",
+                                 headers: { "Content-Type": "application/json", "x-admin-key": adminKey },
+                                 body: JSON.stringify({ accountId: entry.accountId }),
+                               });
+                               if (response.ok) {
+                                 onPrimary();
+                               } else {
+                                 setPromotingId(null);
+                               }
+                             } catch {
+                               setPromotingId(null);
+                             }
+                           }}
+                           disabled={promotingId === entry.accountId}
+                           className="text-[10px] px-2 py-1 rounded-md font-display tracking-wide disabled:opacity-50"
+                           style={{ background: "rgba(96,165,250,0.1)", color: "#93c5fd", border: "1px solid rgba(96,165,250,0.25)" }}
+                           title={health?.reason || "Set this healthy queued account as primary"}
+                         >
+                           {promotingId === entry.accountId ? "SETTING…" : "SET PRIMARY"}
+                         </button>
+                       )}
                     </div>
                   </div>
                 );
@@ -304,6 +381,10 @@ export default function Admin() {
     }
   }, []);
 
+  const refreshAfterPrimary = useCallback(async () => {
+    await fetchRoster(adminKey);
+  }, [adminKey, fetchRoster]);
+
   useEffect(() => {
     if (adminKey) fetchLicenses(adminKey);
   }, []);
@@ -311,6 +392,12 @@ export default function Admin() {
   useEffect(() => {
     if (authenticated && tab === "roster") fetchRoster(adminKey);
   }, [tab, authenticated]);
+
+  useEffect(() => {
+    if (!authenticated || tab !== "roster") return;
+    const timer = window.setInterval(() => fetchRoster(adminKey), 15_000);
+    return () => window.clearInterval(timer);
+  }, [adminKey, authenticated, tab, fetchRoster]);
 
   const login = async () => {
     const k = inputKey.trim();
@@ -613,7 +700,14 @@ export default function Admin() {
                 </div>
               ) : (
                 <div className="space-y-2">
-                  {filteredRoster.map(server => <RosterCard key={server.guildId} server={server} />)}
+                   {filteredRoster.map(server => (
+                     <RosterCard
+                       key={server.guildId}
+                       server={server}
+                       adminKey={adminKey}
+                       onPrimary={refreshAfterPrimary}
+                     />
+                   ))}
                 </div>
               )}
             </motion.div>

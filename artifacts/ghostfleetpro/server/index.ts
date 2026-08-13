@@ -1,7 +1,3 @@
-import { config as dotenvConfig } from "dotenv";
-// Load .env before anything else so PROXY_HOST/PROXY_PORT are in process.env
-dotenvConfig();
-
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
@@ -12,7 +8,7 @@ import { setupGlobalFetchProxy } from "./proxy";
 // ── SOCKS5 proxy: must run before any outbound fetch/WebSocket calls ──────────
 // Routes all Discord HTTP API traffic through the configured proxy.
 // Set PROXY_HOST + PROXY_PORT in .env to activate; no-op when absent.
-setupGlobalFetchProxy();
+await setupGlobalFetchProxy();
 
 // Raise the global listener limit — 100 WebSocket sessions × multiple emitters
 // easily exceeds Node's default of 10, causing false "memory leak" warnings.

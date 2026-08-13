@@ -49,7 +49,7 @@ export default defineConfig({
   ],
   resolve: {
     alias: {
-      '@': path.resolve(import.meta.dirname, 'src'),
+      '@': path.resolve(import.meta.dirname, 'client', 'src'),
       '@assets': path.resolve(
         import.meta.dirname,
         '..',
@@ -59,7 +59,7 @@ export default defineConfig({
     },
     dedupe: ['react', 'react-dom'],
   },
-  root: path.resolve(import.meta.dirname),
+  root: path.resolve(import.meta.dirname, 'client'),
   build: {
     outDir: path.resolve(import.meta.dirname, 'dist/public'),
     emptyOutDir: true,

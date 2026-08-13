@@ -25,6 +25,7 @@ export type ServerRosterEntry = {
   joinedAt: Date;       // time this account+server was added to an ACTIVE rule — determines global rotation order
   lastSeen: Date;       // updated on each sync/heartbeat
   status: "active" | "queued" | "kicked" | "banned" | "left";
+  primaryRequested?: boolean; // admin-selected preference; never overrides health checks
 };
 
 // ─── Interface ────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@ import type { Express, Request, Response } from "express";
 import type { Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
-import { initBotEngine, sendTestMessage, getGatewayStatus, refreshSessions, invalidateRulesCache, getDevFleetEnabled, setDevFleetEnabled, syncRosterFromRules } from "./bot";
+import { initBotEngine, sendTestMessage, getGatewayStatus, refreshSessions, invalidateRulesCache, getDevFleetEnabled, setDevFleetEnabled, syncRosterFromRules, setPrimaryAccount, recomputeRotation, getRosterHealthSnapshot } from "./bot";
 import { z } from "zod";
 import os from "os";
 import crypto from "crypto";
@@ -804,16 +804,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const { guildId, accountId } = req.query as { guildId?: string; accountId?: string };
       if (guildId) {
-        const queue = await storage.getServerQueue(guildId);
-        return res.json(queue);
+        await recomputeRotation(guildId);
+        const refreshedQueue = await storage.getServerQueue(guildId);
+        const health = await getRosterHealthSnapshot(refreshedQueue);
+        return res.json(refreshedQueue.map((entry: any) => ({
+          ...entry,
+          health: health.get(`${entry.guildId}:${entry.accountId}`),
+        })));
       }
       if (accountId) {
         const entries = await storage.getRosterByAccount(accountId);
         return res.json(entries);
       }
-      const db = await (await import("./db")).getDb();
+       const db = await (await import("./db")).getDb();
 
-      // Build a map of guildId → { name, ruleCount } from ALL active rules across all
+       // Build a map of guildId → { name, ruleCount } from ALL active rules across all
       // workspaces — includes both single-account rules (rule.selectedServers) and
       // fleet-wide "all" rules (per-account servers live in rule.profileConfigs)
       const activeRules = await db.collection("rules")
@@ -841,8 +846,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
       }
 
-      // For each rule-active server, fetch its roster queue (may be empty)
+       // Recompute each visible guild before returning it so an old active row
+       // cannot remain displayed as primary while a healthy queued account waits.
       const guildIds = [...ruleServerMap.keys()];
+       await Promise.all(guildIds.map((id) => recomputeRotation(id)));
       const rosterDocs = guildIds.length > 0
         ? await db.collection("server_roster").find({ guildId: { $in: guildIds } }).sort({ joinedAt: 1 }).toArray()
         : [];
@@ -856,29 +863,59 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       // Build response — every rule-active server is listed, even with 0 accounts
-      const response = guildIds.map(guildId => {
+       const response = guildIds.map(guildId => {
         const meta    = ruleServerMap.get(guildId)!;
-        const entries = (byGuild.get(guildId) ?? []).map(({ _id, ...rest }) => rest);
-        const active  = entries.filter((e: any) => e.status === "active").length;
+         const rawEntries = (byGuild.get(guildId) ?? []).map(({ _id, ...rest }) => rest);
+         const healthMapPromise = getRosterHealthSnapshot(rawEntries);
+         const active = rawEntries.filter((entry: any) => entry.status === "active").length;
         return {
           guildId,
-          guildName: entries[0]?.guildName || meta.name,
-          total: entries.length,
+           guildName: rawEntries[0]?.guildName || meta.name,
+           total: rawEntries.length,
           active,
           ruleCount: meta.ruleCount,
-          entries,
+           entries: rawEntries,
+           healthMapPromise,
         };
       });
 
+       const hydratedResponse = await Promise.all(response.map(async (server) => {
+         const health = await server.healthMapPromise;
+         return {
+           guildId: server.guildId,
+           guildName: server.guildName,
+           total: server.total,
+           active: server.active,
+           ruleCount: server.ruleCount,
+           entries: server.entries.map((entry: any) => ({
+             ...entry,
+             health: health.get(`${entry.guildId}:${entry.accountId}`),
+           })),
+         };
+       }));
+
       // Sort: covered first (has active accounts), then by guild name
-      response.sort((a, b) => {
+       hydratedResponse.sort((a, b) => {
         if (b.active !== a.active) return b.active - a.active;
         return a.guildName.localeCompare(b.guildName);
       });
 
-      res.json(response);
+       res.json(hydratedResponse);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/server-roster/:guildId/primary", async (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+      const { accountId } = z.object({ accountId: z.string().min(1) }).parse(req.body);
+      await setPrimaryAccount(req.params.guildId, accountId);
+      logToConsole(`ROSTER: admin selected ${accountId} as preferred primary for ${req.params.guildId}`);
+      res.json({ ok: true });
+    } catch (e: any) {
+      if (e instanceof z.ZodError) return res.status(400).json({ error: e.issues[0]?.message });
+      res.status(400).json({ error: e.message });
     }
   });
 

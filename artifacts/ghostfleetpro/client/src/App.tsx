@@ -1,4 +1,4 @@
-import { Switch, Route } from "wouter";
+import { Switch, Route, Router as WouterRouter } from "wouter";
 import { queryClient } from "./lib/queryClient";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
@@ -34,9 +34,11 @@ function Router() {
   );
 }
 
+const APP_BASE_PATH = (import.meta.env.BASE_URL || "/").replace(/\/+$/, "");
 
 function App() {
-  const isAdmin = window.location.pathname.startsWith("/admin");
+  const isAdmin = window.location.pathname === `${APP_BASE_PATH}/admin` ||
+    window.location.pathname.startsWith(`${APP_BASE_PATH}/admin/`);
   return (
     <QueryClientProvider client={queryClient}>
       {isAdmin ? (
@@ -46,7 +48,9 @@ function App() {
           <WorkspaceProvider>
             <TooltipProvider>
               <Toaster />
-              <Router />
+              <WouterRouter base={APP_BASE_PATH}>
+                <Router />
+              </WouterRouter>
             </TooltipProvider>
           </WorkspaceProvider>
         </LicenseGate>

@@ -8,14 +8,15 @@ import {
   Send, Loader2, Bell, Eye, AlertTriangle, RefreshCw, Search
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { apiRequest } from "@/lib/queryClient";
+import { apiRequest, appUrl } from "@/lib/queryClient";
 
 type Account = {
   id: string;
-  name: string;
+  name?: string | null;
   username?: string;
   avatar?: string;
-  guilds?: { id: string; name: string; icon: string | null }[];
+  status?: string;
+  guilds?: { id: string; name?: string | null; icon: string | null }[];
 };
 type Channel = { id: string; name: string; type: number };
 type Rule = {
@@ -65,6 +66,12 @@ const STEP_ADVANCED = 6;
 
 type ProfileCfg = { selectedServers: {id:string;name:string}[]; selectedChannels: {id:string;name:string;serverId:string}[]; allChannels: boolean };
 
+const accountLabel = (account: Account) =>
+  account.name?.trim() || account.username?.trim() || account.id || "Unnamed account";
+
+const guildLabel = (guild: { id: string; name?: string | null }) =>
+  guild.name?.trim() || guild.id || "Unnamed server";
+
 const BLANK_FORM = {
   label: "", triggerCondition: "keyword", keyword: "",
   profileId: "all", selectedServers: [] as {id:string;name:string}[],
@@ -94,7 +101,8 @@ export default function Rules() {
   const serverItemRefs = useRef<Record<string, HTMLButtonElement | null>>({});
 
   const { data: rules = [], isLoading } = useQuery<Rule[]>({ queryKey: ["/api/rules"], refetchInterval: 10000 });
-  const { data: accounts = [] } = useQuery<Account[]>({ queryKey: ["/api/accounts"] });
+  const { data: rawAccounts = [] } = useQuery<Account[]>({ queryKey: ["/api/accounts"] });
+  const accounts = Array.isArray(rawAccounts) ? rawAccounts : [];
 
   const createMutation = useMutation({
     mutationFn: (data: any) => apiRequest("POST", "/api/rules", data).then(r => r.json()),
@@ -150,15 +158,15 @@ export default function Rules() {
   });
 
   const selectedAccount = accounts.find(a => a.id === form.profileId);
-  const guilds = selectedAccount?.guilds || [];
+  const guilds = Array.isArray(selectedAccount?.guilds) ? selectedAccount.guilds : [];
 
   // Combined unique guild list across all accounts (for fleet mode server picker)
   const fleetGuilds = (() => {
     const seen = new Set<string>();
     const result: { id: string; name: string; icon: string | null }[] = [];
     for (const acc of accounts) {
-      for (const g of ((acc as any).guilds || [])) {
-        if (!seen.has(g.id)) { seen.add(g.id); result.push(g); }
+      for (const g of (Array.isArray(acc.guilds) ? acc.guilds : [])) {
+        if (!seen.has(g.id)) { seen.add(g.id); result.push({ ...g, name: guildLabel(g) }); }
       }
     }
     return result;
@@ -169,7 +177,7 @@ export default function Rules() {
     if (!force && Array.isArray(availableChannels[guildId]) && availableChannels[guildId].length > 0) return;
     setLoadingChannels(prev => ({ ...prev, [guildId]: true }));
     try {
-      const res = await fetch(`/api/accounts/${accountId}/guilds/${guildId}/channels`);
+      const res = await fetch(appUrl(`/api/accounts/${accountId}/guilds/${guildId}/channels`));
       const data = await res.json();
       const channels: Channel[] = Array.isArray(data) ? data : [];
       setAvailableChannels(prev => ({ ...prev, [guildId]: channels }));
@@ -191,7 +199,7 @@ export default function Rules() {
         selectedChannels: f.selectedChannels.filter(c => c.serverId !== guild.id),
       }));
     } else {
-      setForm(f => ({ ...f, selectedServers: [...f.selectedServers, { id: guild.id, name: guild.name }] }));
+      setForm(f => ({ ...f, selectedServers: [...f.selectedServers, { id: guild.id, name: guildLabel(guild) }] }));
       if (form.profileId !== "all") {
         loadChannels(form.profileId, guild.id);
       }
@@ -209,7 +217,7 @@ export default function Rules() {
 
   // ── Fleet-wide per-profile helpers ──────────────────────────────────────────
   const getFleetCfg = (accountId: string): ProfileCfg =>
-    form.profileConfigs[accountId] || { selectedServers: [], selectedChannels: [], allChannels: false };
+    form.profileConfigs?.[accountId] || { selectedServers: [], selectedChannels: [], allChannels: false };
 
   const setFleetCfg = (accountId: string, updater: (prev: ProfileCfg) => ProfileCfg) => {
     setForm(f => ({
@@ -229,7 +237,7 @@ export default function Rules() {
       }));
     } else {
       loadChannels(accountId, guild.id);
-      setFleetCfg(accountId, c => ({ ...c, selectedServers: [...c.selectedServers, { id: guild.id, name: guild.name }] }));
+      setFleetCfg(accountId, c => ({ ...c, selectedServers: [...c.selectedServers, { id: guild.id, name: guildLabel(guild) }] }));
     }
   };
 
@@ -295,7 +303,7 @@ export default function Rules() {
     setLoadingGuilds(true);
     Promise.all(
       accountsNeedingGuilds.map(acc =>
-        fetch(`/api/accounts/${acc.id}/refresh`, { method: "POST" }).catch(() => null)
+        fetch(appUrl(`/api/accounts/${acc.id}/refresh`), { method: "POST" }).catch(() => null)
       )
     ).then(() => {
       queryClient.invalidateQueries({ queryKey: ["/api/accounts"] });
@@ -340,8 +348,8 @@ export default function Rules() {
     if (form.profileId === "all") {
       // Fleet mode: scroll the first match in each account's list
       accounts.forEach(acc => {
-        const accGuilds: any[] = (acc as any).guilds || [];
-        const firstMatch = accGuilds.find(g => g.name.toLowerCase().includes(q));
+        const accGuilds: any[] = Array.isArray(acc.guilds) ? acc.guilds : [];
+        const firstMatch = accGuilds.find(g => guildLabel(g).toLowerCase().includes(q));
         if (firstMatch) {
           const el = serverItemRefs.current[`${acc.id}:${firstMatch.id}`];
           if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -349,7 +357,7 @@ export default function Rules() {
       });
     } else {
       // Single profile mode
-      const firstMatch = guilds.find(g => g.name.toLowerCase().includes(q));
+      const firstMatch = guilds.find(g => guildLabel(g).toLowerCase().includes(q));
       if (firstMatch) {
         const el = serverItemRefs.current[`single:${firstMatch.id}`];
         if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -670,21 +678,21 @@ export default function Rules() {
                                   style={{ border: "1px solid rgba(255,255,255,0.1)" }}>
                                   {acc.avatar
                                     ? <img src={acc.avatar} alt="" className="w-full h-full object-cover" />
-                                    : <div className="w-full h-full flex items-center justify-center text-xs font-bold" style={{ background: "rgba(16,185,129,0.1)", color: "#34d399" }}>{acc.name[0]}</div>}
+                                  : <div className="w-full h-full flex items-center justify-center text-xs font-bold" style={{ background: "rgba(16,185,129,0.1)", color: "#34d399" }}>{accountLabel(acc)[0]}</div>}
                                 </div>
                                 <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border border-black ${isDisconnected ? "bg-red-500" : "status-dot-online"}`} />
                               </div>
                               <div className="flex-1 min-w-0">
                                 <div className="text-sm font-display flex items-center gap-2" style={{ color: isSelected ? "#34d399" : "#f0fdf4" }}>
-                                  {acc.name}
+                                   {accountLabel(acc)}
                                   {isDisconnected && (
                                     <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(239,68,68,0.1)", color: "#ef4444", border: "1px solid rgba(239,68,68,0.2)" }}>
                                       Disconnected
                                     </span>
                                   )}
                                 </div>
-                                <div className="text-xs" style={{ color: "rgba(255,255,255,0.25)" }}>
-                                  @{acc.username} · {(acc.guilds || []).length} servers
+                                 <div className="text-xs" style={{ color: "rgba(255,255,255,0.25)" }}>
+                                   @{acc.username || accountLabel(acc)} · {(Array.isArray(acc.guilds) ? acc.guilds : []).length} servers
                                 </div>
                               </div>
                               {isSelected && <Check className="w-4 h-4 flex-shrink-0" style={{ color: "#10b981" }} />}
@@ -693,7 +701,7 @@ export default function Rules() {
                             {/* Delete button — remove invalid/unwanted accounts */}
                             <button
                               onClick={() => {
-                                if (confirm(`Remove account "${acc.name}"? This will also disconnect it from all rules using it.`)) {
+                                 if (confirm(`Remove account "${accountLabel(acc)}"? This will also disconnect it from all rules using it.`)) {
                                   deleteAccountMutation.mutate(acc.id);
                                   if (form.profileId === acc.id) setForm(f => ({ ...f, profileId: "all" }));
                                 }
@@ -724,7 +732,7 @@ export default function Rules() {
                   <div className="space-y-3">
                     {/* Loading indicator — shown while auto-refreshing guild lists for accounts
                         that have no guild data cached (common when editing existing rules). */}
-                    {loadingGuilds && (
+                               {loadingGuilds && (
                       <div className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs" style={{ background: "rgba(16,185,129,0.07)", border: "1px solid rgba(16,185,129,0.2)", color: "rgba(16,185,129,0.7)" }}>
                         <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
                         Fetching server list…
@@ -761,17 +769,17 @@ export default function Rules() {
                           </div>
                         ) : accounts.map(acc => {
                           const cfg = getFleetCfg(acc.id);
-                          const accGuilds = (acc as any).guilds || [];
+                           const accGuilds = Array.isArray(acc.guilds) ? acc.guilds : [];
                           const sq = serverSearch.toLowerCase().trim();
-                          const hasMatch = sq ? accGuilds.some((g: any) => g.name.toLowerCase().includes(sq)) : false;
+                           const hasMatch = sq ? accGuilds.some((g: any) => guildLabel(g).toLowerCase().includes(sq)) : false;
                           return (
                             <div key={acc.id} className="rounded-xl overflow-hidden transition-all"
                               style={{ border: `1px solid ${hasMatch && sq ? "rgba(16,185,129,0.4)" : "rgba(16,185,129,0.15)"}`, background: "rgba(0,0,0,0.2)" }}>
                               <div className="flex items-center gap-2 px-3 py-2" style={{ borderBottom: "1px solid rgba(255,255,255,0.05)", background: hasMatch && sq ? "rgba(16,185,129,0.07)" : "rgba(16,185,129,0.04)" }}>
-                                {(acc as any).avatar
-                                  ? <img src={(acc as any).avatar} className="w-5 h-5 rounded-full" alt="" />
-                                  : <div className="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: "rgba(16,185,129,0.2)", color: "#34d399" }}>{acc.name[0]}</div>}
-                                <span className="text-xs font-display tracking-wider" style={{ color: "#34d399" }}>{acc.name}</span>
+                                 {acc.avatar
+                                   ? <img src={acc.avatar} className="w-5 h-5 rounded-full" alt="" />
+                                   : <div className="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: "rgba(16,185,129,0.2)", color: "#34d399" }}>{accountLabel(acc)[0]}</div>}
+                                 <span className="text-xs font-display tracking-wider" style={{ color: "#34d399" }}>{accountLabel(acc)}</span>
                                 {hasMatch && sq && (
                                   <span className="text-xs ml-1 px-1.5 py-0.5 rounded" style={{ background: "rgba(16,185,129,0.15)", color: "#34d399" }}>found</span>
                                 )}
@@ -785,8 +793,9 @@ export default function Rules() {
                                 <div className="grid grid-cols-1 gap-1 p-2 max-h-48 overflow-y-auto">
                                   {accGuilds.map((guild: any) => {
                                     const isSel = cfg.selectedServers.some((s: any) => s.id === guild.id);
-                                    const isMatch = sq ? guild.name.toLowerCase().includes(sq) : false;
-                                    const iconUrl = guild.icon ? `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png?size=32` : null;
+                                   const name = guildLabel(guild);
+                                   const isMatch = sq ? name.toLowerCase().includes(sq) : false;
+                                   const iconUrl = guild.icon ? `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png?size=32` : null;
                                     return (
                                       <button
                                         key={guild.id}
@@ -797,9 +806,9 @@ export default function Rules() {
                                           background: isMatch && sq ? "rgba(16,185,129,0.12)" : isSel ? "rgba(16,185,129,0.08)" : "rgba(0,0,0,0.15)",
                                           border: `1px solid ${isMatch && sq ? "rgba(16,185,129,0.5)" : isSel ? "rgba(16,185,129,0.3)" : "rgba(255,255,255,0.04)"}`,
                                         }}>
-                                        {iconUrl ? <img src={iconUrl} alt={guild.name} className="w-6 h-6 rounded-full flex-shrink-0" />
-                                          : <div className="w-6 h-6 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold" style={{ background: "rgba(16,185,129,0.15)", color: "#34d399" }}>{guild.name[0]}</div>}
-                                        <span className="flex-1 text-xs truncate" style={{ color: isMatch && sq ? "#34d399" : isSel ? "#34d399" : "rgba(255,255,255,0.7)" }}>{guild.name}</span>
+                                         {iconUrl ? <img src={iconUrl} alt={name} className="w-6 h-6 rounded-full flex-shrink-0" />
+                                           : <div className="w-6 h-6 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold" style={{ background: "rgba(16,185,129,0.15)", color: "#34d399" }}>{name[0]}</div>}
+                                         <span className="flex-1 text-xs truncate" style={{ color: isMatch && sq ? "#34d399" : isSel ? "#34d399" : "rgba(255,255,255,0.7)" }}>{name}</span>
                                         <div className="w-4 h-4 rounded flex items-center justify-center flex-shrink-0"
                                           style={{ background: isSel ? "#10b981" : "rgba(255,255,255,0.05)", border: isSel ? "none" : "1px solid rgba(255,255,255,0.1)" }}>
                                           {isSel && <Check className="w-2.5 h-2.5 text-black" />}
@@ -829,7 +838,8 @@ export default function Rules() {
                           {guilds.map((guild: any) => {
                             const isSelected = form.selectedServers.some(s => s.id === guild.id);
                             const sq = serverSearch.toLowerCase().trim();
-                            const isMatch = sq ? guild.name.toLowerCase().includes(sq) : false;
+                             const name = guildLabel(guild);
+                             const isMatch = sq ? name.toLowerCase().includes(sq) : false;
                             const iconUrl = guild.icon ? `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png?size=32` : null;
                             return (
                               <button
@@ -842,14 +852,14 @@ export default function Rules() {
                                   border: `1px solid ${isMatch && sq ? "rgba(16,185,129,0.5)" : isSelected ? "rgba(16,185,129,0.3)" : "rgba(255,255,255,0.05)"}`,
                                 }}>
                                 {iconUrl ? (
-                                  <img src={iconUrl} alt={guild.name} className="w-8 h-8 rounded-full flex-shrink-0" />
+                                   <img src={iconUrl} alt={name} className="w-8 h-8 rounded-full flex-shrink-0" />
                                 ) : (
                                   <div className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-sm font-bold"
                                     style={{ background: "rgba(16,185,129,0.15)", color: "#34d399" }}>
-                                    {guild.name[0]}
+                                     {name[0]}
                                   </div>
                                 )}
-                                <span className="flex-1 text-sm" style={{ color: isMatch && sq ? "#34d399" : isSelected ? "#34d399" : "#f0fdf4" }}>{guild.name}</span>
+                                 <span className="flex-1 text-sm" style={{ color: isMatch && sq ? "#34d399" : isSelected ? "#34d399" : "#f0fdf4" }}>{name}</span>
                                 <div className={`w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0`}
                                   style={{ background: isSelected ? "#10b981" : "rgba(255,255,255,0.05)", border: isSelected ? "none" : "1px solid rgba(255,255,255,0.1)" }}>
                                   {isSelected && <Check className="w-3 h-3 text-black" />}
@@ -874,10 +884,10 @@ export default function Rules() {
                           return (
                             <div key={acc.id} className="rounded-xl overflow-hidden" style={{ border: "1px solid rgba(16,185,129,0.15)", background: "rgba(0,0,0,0.2)" }}>
                               <div className="flex items-center gap-2 px-3 py-2" style={{ borderBottom: "1px solid rgba(255,255,255,0.05)", background: "rgba(16,185,129,0.04)" }}>
-                                {(acc as any).avatar
-                                  ? <img src={(acc as any).avatar} className="w-5 h-5 rounded-full" alt="" />
-                                  : <div className="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: "rgba(16,185,129,0.2)", color: "#34d399" }}>{acc.name[0]}</div>}
-                                <span className="text-xs font-display tracking-wider" style={{ color: "#34d399" }}>{acc.name}</span>
+                                {acc.avatar
+                                  ? <img src={acc.avatar} className="w-5 h-5 rounded-full" alt="" />
+                                  : <div className="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: "rgba(16,185,129,0.2)", color: "#34d399" }}>{accountLabel(acc)[0]}</div>}
+                                <span className="text-xs font-display tracking-wider" style={{ color: "#34d399" }}>{accountLabel(acc)}</span>
                               </div>
                               <div className="p-2 space-y-2">
                                 {/* All-channels toggle per account */}

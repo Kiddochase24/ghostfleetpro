@@ -14,10 +14,12 @@
  * every subsequent fetch() call is transparently tunnelled.
  */
 
-import { Agent, setGlobalDispatcher } from "undici";
-import { SocksProxyAgent } from "socks-proxy-agent";
-import { SocksClient } from "socks";
+import { createRequire } from "node:module";
 import tls from "node:tls";
+
+const require = createRequire(import.meta.url);
+let SocksClient: any;
+let SocksProxyAgent: any;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -40,11 +42,14 @@ function buildSocksUrl(): string {
 // Returned value is passed directly to `new WebSocket(url, { agent })`.
 // The ws package forwards it to the underlying TLS/TCP handshake.
 
-let _wsAgent: SocksProxyAgent | undefined;
+let _wsAgent: any;
 
-export function getWsAgent(): SocksProxyAgent | undefined {
+export function getWsAgent(): any {
   if (!isProxyConfigured()) return undefined;
   if (!_wsAgent) {
+    if (!SocksProxyAgent) {
+      SocksProxyAgent = require("socks-proxy-agent").SocksProxyAgent;
+    }
     _wsAgent = new SocksProxyAgent(buildSocksUrl(), {
       keepAlive: true,
       // Reconnect quickly if the proxy socket drops
@@ -59,11 +64,15 @@ export function getWsAgent(): SocksProxyAgent | undefined {
 // in bot.ts, routes.ts, and anywhere else — is tunnelled through SOCKS5
 // automatically, with no per-call changes needed.
 
-export function setupGlobalFetchProxy(): void {
+export async function setupGlobalFetchProxy(): Promise<void> {
   if (!isProxyConfigured()) {
     console.log("[proxy] No PROXY_HOST/PROXY_PORT — using direct connections");
     return;
   }
+
+  const { Agent, setGlobalDispatcher } = await import("undici");
+  SocksClient = require("socks").SocksClient;
+  SocksProxyAgent = require("socks-proxy-agent").SocksProxyAgent;
 
   const proxyHost = process.env.PROXY_HOST!;
   const proxyPort = parseInt(process.env.PROXY_PORT!, 10);

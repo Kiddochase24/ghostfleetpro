@@ -766,8 +766,94 @@ async function recomputeAccountRotations(accountId: string): Promise<void> {
   }
 }
 
+export type RosterHealth = {
+  accountStatus: string;
+  gatewayReady: boolean;
+  inServer: boolean;
+  tokenValid: boolean | null;
+  tokenCheckedAt: Date | null;
+  healthy: boolean;
+  reason: string;
+};
+
+const tokenHealth = new Map<string, { valid: boolean; checkedAt: number }>();
+const TOKEN_HEALTH_TTL_MS = 60_000;
+
+async function checkAccountToken(account: any): Promise<boolean | null> {
+  const cached = tokenHealth.get(account.id);
+  if (cached && Date.now() - cached.checkedAt < TOKEN_HEALTH_TTL_MS) return cached.valid;
+
+  try {
+    const response = await fetch(`${DISCORD_API}/users/@me`, {
+      headers: { ...makeHeaders(getFingerprint(account.id)), Authorization: account.token },
+    });
+    if (response.ok) {
+      tokenHealth.set(account.id, { valid: true, checkedAt: Date.now() });
+      return true;
+    }
+    if (response.status === 401 || response.status === 403) {
+      tokenHealth.set(account.id, { valid: false, checkedAt: Date.now() });
+      await storage.updateAccountStatus(account.id, "Disconnected");
+      return false;
+    }
+    return cached?.valid ?? null;
+  } catch {
+    // A transient network failure is not proof that a token is invalid.
+    return cached?.valid ?? false;
+  }
+}
+
+async function getRosterHealth(
+  entry: any,
+  accounts: Map<string, any>,
+): Promise<RosterHealth> {
+  const account = accounts.get(entry.accountId);
+  const session = sessions.get(entry.accountId);
+  const gatewayReady = !!session &&
+    gatewayStatus.get(entry.accountId) === "ready" &&
+    session.isReady;
+  const inServer = !!session?.guildIds.includes(entry.guildId);
+  const tokenValid = account ? await checkAccountToken(account) : false;
+  const accountStatus = account?.status ?? "Missing";
+  const healthy = accountStatus === "Connected" && tokenValid === true && gatewayReady && inServer;
+  const reason = !account
+    ? "Account missing"
+    : accountStatus !== "Connected"
+      ? `Account ${accountStatus.toLowerCase()}`
+        : tokenValid !== true
+        ? "Token invalid or not verified"
+        : !gatewayReady
+          ? "Gateway not ready"
+          : !inServer
+            ? "Account is not in this server"
+            : "Healthy";
+  const checked = tokenHealth.get(entry.accountId);
+  return {
+    accountStatus,
+    gatewayReady,
+    inServer,
+    tokenValid,
+    tokenCheckedAt: checked ? new Date(checked.checkedAt) : null,
+    healthy,
+    reason,
+  };
+}
+
+export async function getRosterHealthSnapshot(entries: any[]): Promise<Map<string, RosterHealth>> {
+  const accounts = await storage.getAccounts();
+  const accountMap = new Map(accounts.map((account) => [account.id, account]));
+  const results = await Promise.all(
+    entries.map(async (entry) => [
+      `${entry.guildId}:${entry.accountId}`,
+      await getRosterHealth(entry, accountMap),
+    ] as const),
+  );
+  return new Map(results);
+}
+
 // Recompute active/queued status for every roster row of a single guild: the
-// earliest joinedAt among eligible rows becomes "active", the rest "queued".
+// preferred healthy row becomes "active", otherwise the earliest healthy row
+// becomes active. Unhealthy rows can never retain ownership of a server.
 export async function recomputeRotation(guildId: string): Promise<void> {
   // Bust the per-account cache for this guild so the next message sees the new status
   invalidateRosterCache(guildId);
@@ -781,19 +867,12 @@ export async function recomputeRotation(guildId: string): Promise<void> {
 
   const accounts = await storage.getAccounts();
   const accountStatus = new Map(accounts.map((account) => [account.id, account]));
-  const healthy = eligible.filter((row) => {
-    const account = accountStatus.get(row.accountId);
-    const session = sessions.get(row.accountId);
-    return (
-      account?.status === "Connected" &&
-      !!account.token &&
-      !!session &&
-      gatewayStatus.get(row.accountId) === "ready" &&
-      session.isReady &&
-      session.guildIds.includes(guildId)
-    );
-  });
-  const primary = healthy[0];
+  const health = await Promise.all(
+    eligible.map(async (row) => ({ row, health: await getRosterHealth(row, accountStatus) })),
+  );
+  const healthy = health.filter(({ health: state }) => state.healthy).map(({ row }) => row);
+  const preferred = healthy.find((row) => row.primaryRequested === true);
+  const primary = preferred ?? healthy[0];
   const ops: Promise<any>[] = [];
   for (const row of eligible) {
     const desiredStatus =
@@ -820,6 +899,45 @@ export async function recomputeRotation(guildId: string): Promise<void> {
     activeAccountName: primary.accountName,
     queueSize: healthy.length,
   });
+}
+
+// Admin-selected promotion. The preference is persisted, but health checks still
+// decide whether this account may actually own the live slot.
+export async function setPrimaryAccount(guildId: string, accountId: string): Promise<void> {
+  const db = await getDb();
+  const target = await db.collection("server_roster").findOne({
+    guildId,
+    accountId,
+    status: { $in: ["active", "queued"] },
+  });
+  if (!target) throw new Error("Account is not in the active roster for this server");
+  const health = await getRosterHealthSnapshot([target]);
+  if (!health.get(`${guildId}:${accountId}`)?.healthy) {
+    throw new Error("Account failed the primary health checks; it remains queued");
+  }
+
+  await db.collection("server_roster").updateMany(
+    { guildId, status: { $in: ["active", "queued"] } },
+    { $set: { primaryRequested: false } },
+  );
+  await db.collection("server_roster").updateOne(
+    { _id: target._id },
+    { $set: { primaryRequested: true } },
+  );
+  await recomputeRotation(guildId);
+}
+
+async function verifyRosterHealth(): Promise<void> {
+  try {
+    const db = await getDb();
+    const rows = await db.collection("server_roster")
+      .find({ status: { $in: ["active", "queued"] } })
+      .toArray();
+    const guildIds = new Set(rows.map((row) => row.guildId));
+    for (const guildId of guildIds) await recomputeRotation(guildId);
+  } catch (e: any) {
+    logFn(`ROSTER HEALTH ERR: ${e.message}`);
+  }
 }
 
 // Reads every ACTIVE rule across ALL workspaces, resolves the (accountId, guildId)
@@ -1042,6 +1160,9 @@ export function initBotEngine(
 
   // Sync sessions every 15s — opens/closes sessions to match DB
   setInterval(syncSessions, 15000);
+  // Re-evaluate every roster slot on a short cadence. This repairs persisted
+  // active rows when a token, gateway, or server membership becomes stale.
+  setInterval(verifyRosterHealth, 30_000);
   // Watchdog every 30s — recovers orphaned dead sessions + broadcasts health
   setInterval(gatewayWatchdog, 30000);
   // Periodic OP 14 renewal every 10 minutes — keeps MESSAGE_CREATE flowing.

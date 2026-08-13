@@ -8,11 +8,11 @@ router = "path"
 
 [[services]]
 name = "web"
-paths = [ "/ghostfleetpro/" ]
+paths = [ "/ghostfleetpro/", "/ghostfleetpro/api", "/ghostfleetpro/ws" ]
 localPort = 24661
 
 [services.development]
-run = "pnpm --filter @workspace/ghostfleetpro run dev"
+run = "pnpm --filter @workspace/ghostfleetpro run dev:server"
 
 [services.production]
 build = [ "pnpm", "--filter", "@workspace/ghostfleetpro", "run", "build" ]
