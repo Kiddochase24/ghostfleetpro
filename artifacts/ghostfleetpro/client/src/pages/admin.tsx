@@ -31,6 +31,7 @@ interface RosterEntry {
     tokenValid: boolean | null;
     tokenCheckedAt: string | null;
     healthy: boolean;
+    stale: boolean;
     reason: string;
   };
 }
@@ -233,6 +234,8 @@ function RosterCard({
                  const isPrimary = entry.status === "active";
                  const health = entry.health;
                  const canPromote = entry.status === "queued" && health?.healthy === true;
+                  const isStale = (entry.status === "active" || entry.status === "queued")
+                    && health?.stale === true;
                 return (
                   <div key={entry.accountId} className="flex items-center gap-3 px-3 py-2 rounded-lg"
                     style={{ background: isPrimary ? "rgba(16,185,129,0.05)" : "rgba(0,0,0,0.2)", border: `1px solid ${isPrimary ? "rgba(16,185,129,0.15)" : "rgba(255,255,255,0.04)"}` }}>
@@ -250,6 +253,12 @@ function RosterCard({
                             PRIMARY
                           </span>
                         )}
+                         {isPrimary && entry.primaryRequested && (
+                           <span className="text-[10px] px-1.5 py-0.5 rounded font-display"
+                             style={{ background: "rgba(96,165,250,0.1)", color: "#93c5fd", border: "1px solid rgba(96,165,250,0.2)" }}>
+                             OVERRIDE
+                           </span>
+                         )}
                          {entry.primaryRequested && !isPrimary && (
                            <span className="text-[10px] px-1.5 py-0.5 rounded font-display"
                              style={{ background: "rgba(251,191,36,0.1)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.2)" }}>
@@ -268,9 +277,9 @@ function RosterCard({
                          <HealthCheck label="Gateway" ok={health?.gatewayReady === true} pending={!health} />
                          <HealthCheck label="Server" ok={health?.inServer === true} pending={!health} />
                          <HealthCheck label="Token" ok={health?.tokenValid === true} pending={!health || health.tokenValid === null} />
-                         {health && !health.healthy && (
+                          {health && !health.healthy && (
                            <span className="text-[10px] truncate max-w-44" style={{ color: "#f87171" }} title={health.reason}>
-                             {health.reason}
+                              {isStale ? `STALE · ${health.reason}` : health.reason}
                            </span>
                          )}
                        </div>
@@ -306,11 +315,30 @@ function RosterCard({
                            disabled={promotingId === entry.accountId}
                            className="text-[10px] px-2 py-1 rounded-md font-display tracking-wide disabled:opacity-50"
                            style={{ background: "rgba(96,165,250,0.1)", color: "#93c5fd", border: "1px solid rgba(96,165,250,0.25)" }}
-                           title={health?.reason || "Set this healthy queued account as primary"}
+                            title="Use this healthy queued account instead of the automatic queue choice"
                          >
-                           {promotingId === entry.accountId ? "SETTING…" : "SET PRIMARY"}
+                            {promotingId === entry.accountId ? "OVERRIDING…" : "OVERRIDE"}
                          </button>
                        )}
+                        {isPrimary && entry.primaryRequested && (
+                          <button
+                            onClick={async (event) => {
+                              event.stopPropagation();
+                              try {
+                                const response = await fetch(`/api/admin/server-roster/${server.guildId}/primary`, {
+                                  method: "DELETE",
+                                  headers: { "x-admin-key": adminKey },
+                                });
+                                if (response.ok) onPrimary();
+                              } catch {}
+                            }}
+                            className="text-[10px] px-2 py-1 rounded-md font-display tracking-wide"
+                            style={{ background: "rgba(251,191,36,0.08)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.2)" }}
+                            title="Return this server to automatic healthy-account rotation"
+                          >
+                            AUTO ROTATE
+                          </button>
+                        )}
                     </div>
                   </div>
                 );

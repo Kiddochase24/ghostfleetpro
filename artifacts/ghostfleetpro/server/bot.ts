@@ -773,6 +773,7 @@ export type RosterHealth = {
   tokenValid: boolean | null;
   tokenCheckedAt: Date | null;
   healthy: boolean;
+  stale: boolean;
   reason: string;
 };
 
@@ -835,6 +836,7 @@ async function getRosterHealth(
     tokenValid,
     tokenCheckedAt: checked ? new Date(checked.checkedAt) : null,
     healthy,
+    stale: !healthy,
     reason,
   };
 }
@@ -854,6 +856,10 @@ export async function getRosterHealthSnapshot(entries: any[]): Promise<Map<strin
 // Recompute active/queued status for every roster row of a single guild: the
 // preferred healthy row becomes "active", otherwise the earliest healthy row
 // becomes active. Unhealthy rows can never retain ownership of a server.
+//
+// A persisted roster row can outlive its account session, token, or server
+// membership. Keep that row visible for diagnosis, but stamp it as stale and
+// force it out of the active slot so it cannot block a healthy replacement.
 export async function recomputeRotation(guildId: string): Promise<void> {
   // Bust the per-account cache for this guild so the next message sees the new status
   invalidateRosterCache(guildId);
@@ -874,16 +880,23 @@ export async function recomputeRotation(guildId: string): Promise<void> {
   const preferred = healthy.find((row) => row.primaryRequested === true);
   const primary = preferred ?? healthy[0];
   const ops: Promise<any>[] = [];
-  for (const row of eligible) {
+  for (const { row, health: state } of health) {
     const desiredStatus =
       primary && row._id?.toString() === primary._id?.toString()
         ? "active"
         : "queued";
-    if (row.status !== desiredStatus) {
+    const staleUpdate = state.stale
+      ? { stale: true, staleReason: state.reason, staleAt: row.staleAt ?? new Date() }
+      : { stale: false, staleReason: null, staleAt: null };
+    if (
+      row.status !== desiredStatus ||
+      row.stale !== staleUpdate.stale ||
+      row.staleReason !== staleUpdate.staleReason
+    ) {
       ops.push(
         db.collection("server_roster").updateOne(
           { _id: row._id },
-          { $set: { status: desiredStatus } },
+          { $set: { status: desiredStatus, ...staleUpdate } },
         ),
       );
     }
@@ -923,6 +936,17 @@ export async function setPrimaryAccount(guildId: string, accountId: string): Pro
   await db.collection("server_roster").updateOne(
     { _id: target._id },
     { $set: { primaryRequested: true } },
+  );
+  await recomputeRotation(guildId);
+}
+
+// Return a server to automatic queue ordering. The next recomputation chooses
+// the preferred healthy row, then the earliest healthy row.
+export async function clearPrimaryAccount(guildId: string): Promise<void> {
+  const db = await getDb();
+  await db.collection("server_roster").updateMany(
+    { guildId, status: { $in: ["active", "queued"] } },
+    { $set: { primaryRequested: false } },
   );
   await recomputeRotation(guildId);
 }

@@ -2,7 +2,7 @@ import type { Express, Request, Response } from "express";
 import type { Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
-import { initBotEngine, sendTestMessage, getGatewayStatus, refreshSessions, invalidateRulesCache, getDevFleetEnabled, setDevFleetEnabled, syncRosterFromRules, setPrimaryAccount, recomputeRotation, getRosterHealthSnapshot } from "./bot";
+import { initBotEngine, sendTestMessage, getGatewayStatus, refreshSessions, invalidateRulesCache, getDevFleetEnabled, setDevFleetEnabled, syncRosterFromRules, setPrimaryAccount, clearPrimaryAccount, recomputeRotation, getRosterHealthSnapshot } from "./bot";
 import { z } from "zod";
 import os from "os";
 import crypto from "crypto";
@@ -916,6 +916,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       res.json({ ok: true });
     } catch (e: any) {
       if (e instanceof z.ZodError) return res.status(400).json({ error: e.issues[0]?.message });
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/admin/server-roster/:guildId/primary", async (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+      await clearPrimaryAccount(req.params.guildId);
+      logToConsole(`ROSTER: cleared admin primary override for ${req.params.guildId}`);
+      res.json({ ok: true });
+    } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
   });
