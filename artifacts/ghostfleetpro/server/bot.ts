@@ -678,6 +678,9 @@ const pendingResumes = new Map<
 >();
 // Exponential backoff retry counter per account
 const retryCount = new Map<string, number>();
+// Names are retained while a socket is reconnecting so the dashboard can show
+// the account instead of making it disappear when sessions.delete() runs.
+const gatewayAccountNames = new Map<string, string>();
 // Track accounts that have a pending reconnect timer so the watchdog
 // doesn't race and open a second session.
 const pendingReconnects = new Set<string>();
@@ -685,9 +688,12 @@ const pendingReconnects = new Set<string>();
 // Discord's gateway should not receive a fleet-wide connection burst. Keep the
 // queue shared by initial opens, watchdog recovery, and scheduled reconnects so
 // no caller can bypass the connection limit.
-const GATEWAY_OPEN_BATCH_SIZE = 10;
-const GATEWAY_OPEN_BATCH_DELAY_MIN_MS = 2000;
-const GATEWAY_OPEN_BATCH_DELAY_MAX_MS = 3000;
+// Discord can close an entire fleet when too many sessions identify during
+// the same gateway window. Open one socket at a time and leave a full window
+// between opens so recovery does not immediately create another 1006 storm.
+const GATEWAY_OPEN_BATCH_SIZE = 1;
+const GATEWAY_OPEN_BATCH_DELAY_MIN_MS = 5000;
+const GATEWAY_OPEN_BATCH_DELAY_MAX_MS = 7000;
 const gatewayOpenQueue = new Map<
   string,
   { accountId: string; accountName: string; token: string }
@@ -1226,8 +1232,17 @@ function scheduleGatewayOpen(
   accountName: string,
   token: string,
 ) {
+  if (!isFleetActive()) return;
   if (sessions.has(accountId) || gatewayOpenQueue.has(accountId)) return;
   gatewayOpenQueue.set(accountId, { accountId, accountName, token });
+  gatewayAccountNames.set(accountId, accountName);
+  gatewayStatus.set(accountId, "connecting");
+  broadcastFn("gatewayStatus", {
+    accountId,
+    accountName,
+    status: "connecting",
+  });
+  broadcastGatewayHealth();
   // Defer one turn so a sync pass can enqueue its whole fleet before the
   // first batch is selected. Without this, each call from a loop would pump a
   // one-account batch immediately.
@@ -1299,8 +1314,8 @@ async function syncSessions() {
       : [];
 
     // All opens go through one bounded queue. This includes the first fleet
-    // startup, so 550 accounts become batches of 10 with a 2–3s pause between
-    // batches instead of a loop that eventually creates 550 live sockets.
+    // startup, so accounts are opened one at a time with a full gateway window
+    // between attempts instead of creating an identify burst.
     for (const acc of connected) {
       if (!sessions.has(acc.id) && !pendingReconnects.has(acc.id)) {
         scheduleGatewayOpen(acc.id, acc.name, acc.token);
@@ -1315,7 +1330,12 @@ async function syncSessions() {
     // Drop queued opens for accounts that were disconnected while waiting.
     const connectedIds = new Set(connected.map((acc) => acc.id));
     for (const accountId of gatewayOpenQueue.keys()) {
-      if (!connectedIds.has(accountId)) removeQueuedGatewayOpen(accountId);
+      if (!connectedIds.has(accountId)) {
+        removeQueuedGatewayOpen(accountId);
+        gatewayStatus.delete(accountId);
+        gatewayAccountNames.delete(accountId);
+        broadcastFn("gatewayStatus", { accountId, status: "dead" });
+      }
     }
   } catch (e: any) {
     logFn(`BOT SYNC ERROR: ${e.message}`);
@@ -1329,6 +1349,7 @@ function openSession(accountId: string, accountName: string, token: string) {
   // example a reconnect timer firing at the same time as a sync tick).
   gatewayOpenQueue.delete(accountId);
   pendingReconnects.delete(accountId);
+  gatewayAccountNames.set(accountId, accountName);
   gatewayStatus.set(accountId, "connecting");
   broadcastFn("gatewayStatus", { accountId, status: "connecting" });
 
@@ -1412,8 +1433,22 @@ function openSession(accountId: string, accountName: string, token: string) {
     } catch {}
   });
 
-  ws.on("close", (code) => {
-    logFn(`GATEWAY CLOSED: ${accountName} (code ${code})`);
+  ws.on("close", (code, reason) => {
+    // closeSession() removes the old session before closing its socket. A
+    // replacement can be opened before the old socket emits close; never let
+    // that late event delete or downgrade the replacement.
+    if (sessions.get(accountId) !== session) {
+      clearTimers(session);
+      logFn(
+        `GATEWAY CLOSED (stale socket ignored): ${accountName} (code ${code})`,
+      );
+      return;
+    }
+    const closeReason = reason?.toString("utf8").trim();
+    logFn(
+      `GATEWAY CLOSED: ${accountName} (code ${code}` +
+        `${closeReason ? `, reason ${closeReason}` : ""})`,
+    );
     clearTimers(session);
     sessions.delete(accountId);
     gatewayStatus.set(accountId, "dead");
@@ -1472,9 +1507,24 @@ function openSession(accountId: string, accountName: string, token: string) {
       pendingReconnects.add(accountId);
       session.reconnectTimer = setTimeout(async () => {
         pendingReconnects.delete(accountId);
-        const acc = await storage.getAccount(accountId);
-        if (acc && acc.status === "Connected") {
-          scheduleGatewayOpen(accountId, accountName, acc.token || token);
+        try {
+          const acc = await storage.getAccount(accountId);
+          if (isFleetActive() && acc && acc.status === "Connected") {
+            scheduleGatewayOpen(accountId, accountName, acc.token || token);
+          } else if (!acc || acc.status !== "Connected") {
+            pendingResumes.delete(accountId);
+            gatewayStatus.delete(accountId);
+            gatewayAccountNames.delete(accountId);
+            broadcastGatewayHealth();
+          }
+        } catch (error: any) {
+          // Leave the account marked dead so the watchdog can retry on the
+          // next tick instead of losing it on a transient MongoDB failure.
+          gatewayStatus.set(accountId, "dead");
+          logFn(
+            `RECONNECT LOOKUP ERR: ${accountName}: ${error?.message || error}`,
+          );
+          broadcastGatewayHealth();
         }
       }, backoff);
     } else {
@@ -1488,6 +1538,13 @@ function openSession(accountId: string, accountName: string, token: string) {
 
   ws.on("error", (err) => {
     logFn(`GATEWAY ERR: ${accountName}: ${err.message}`);
+    // ws normally emits close after error, but terminate explicitly so a
+    // transport error can never leave the account stuck in "connecting".
+    if (sessions.get(accountId) === session) {
+      try {
+        session.ws.terminate();
+      } catch {}
+    }
   });
 }
 
@@ -1496,6 +1553,8 @@ function closeSession(accountId: string) {
   if (!s) {
     removeQueuedGatewayOpen(accountId);
     pendingReconnects.delete(accountId);
+    gatewayAccountNames.delete(accountId);
+    gatewayStatus.delete(accountId);
     return;
   }
   s.shouldReconnect = false;
@@ -1515,6 +1574,7 @@ function closeSession(accountId: string) {
   } catch {}
   sessions.delete(accountId);
   gatewayStatus.delete(accountId);
+  gatewayAccountNames.delete(accountId);
   // This path is also used when the DB account is manually disconnected, so
   // do not wait for the websocket close event to release roster ownership.
   recomputeAccountRotations(accountId).catch(() => {});
@@ -3055,11 +3115,23 @@ export function getGatewayStatus(): {
   accountName: string;
   status: string;
 }[] {
-  return Array.from(sessions.values()).map((s) => ({
-    accountId: s.accountId,
-    accountName: s.accountName,
-    status: gatewayStatus.get(s.accountId) || "connecting",
-  }));
+  const accountIds = new Set([
+    ...gatewayStatus.keys(),
+    ...gatewayOpenQueue.keys(),
+    ...sessions.keys(),
+  ]);
+  return Array.from(accountIds).map((accountId) => {
+    const session = sessions.get(accountId);
+    return {
+      accountId,
+      accountName:
+        session?.accountName ||
+        gatewayOpenQueue.get(accountId)?.accountName ||
+        gatewayAccountNames.get(accountId) ||
+        accountId,
+      status: gatewayStatus.get(accountId) || "dead",
+    };
+  });
 }
 
 export function refreshSessions() {
