@@ -1,2 +1,3 @@
 - [Ghost Fleet reply ownership](ghostfleet-reply-ownership.md) — roster promotion must require persisted account health and a live ready gateway session.
 - [Ghost Fleet artifact entrypoint](ghostfleet-artifact-entrypoint.md) — the runnable app lives under client/, while the artifact root may contain an unused placeholder tree.
+- [Gateway recovery session state](gateway-recovery.md) — preserve resume metadata across socket replacement, but clear every copy after INVALID_SESSION.

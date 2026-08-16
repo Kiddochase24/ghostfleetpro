@@ -227,14 +227,19 @@ interface GatewaySession {
   token: string;
   ws: WebSocket;
   heartbeatTimer: NodeJS.Timeout | null;
+  initialHeartbeatTimer: NodeJS.Timeout | null;
   heartbeatAcked: boolean;
   sessionId: string | null;
   resumeUrl: string | null;
   seq: number | null;
   reconnectTimer: NodeJS.Timeout | null;
+  identifyTimer: NodeJS.Timeout | null;
   // Guards against hung TCP handshakes that never receive a HELLO (op 10).
   // Cleared as soon as HELLO arrives; terminates the socket if it never does.
   helloTimer: NodeJS.Timeout | null;
+  // False when the session is being closed because the account was disabled or
+  // removed. A deliberate close must never enter the reconnect path.
+  shouldReconnect: boolean;
   isReady: boolean;
   guildIds: string[];
   discordUserId: string | null;
@@ -676,6 +681,20 @@ const retryCount = new Map<string, number>();
 // Track accounts that have a pending reconnect timer so the watchdog
 // doesn't race and open a second session.
 const pendingReconnects = new Set<string>();
+
+// Discord's gateway should not receive a fleet-wide connection burst. Keep the
+// queue shared by initial opens, watchdog recovery, and scheduled reconnects so
+// no caller can bypass the connection limit.
+const GATEWAY_OPEN_BATCH_SIZE = 10;
+const GATEWAY_OPEN_BATCH_DELAY_MIN_MS = 2000;
+const GATEWAY_OPEN_BATCH_DELAY_MAX_MS = 3000;
+const gatewayOpenQueue = new Map<
+  string,
+  { accountId: string; accountName: string; token: string }
+>();
+let gatewayOpenPumpTimer: NodeJS.Timeout | null = null;
+let gatewayOpenPumpRunning = false;
+
 let broadcastFn: (event: string, data: any) => void = () => {};
 let logFn: (msg: string, wsId?: number) => void = () => {};
 
@@ -1202,6 +1221,74 @@ export function initBotEngine(
   }, 10 * 60 * 1000);
 }
 
+function scheduleGatewayOpen(
+  accountId: string,
+  accountName: string,
+  token: string,
+) {
+  if (sessions.has(accountId) || gatewayOpenQueue.has(accountId)) return;
+  gatewayOpenQueue.set(accountId, { accountId, accountName, token });
+  // Defer one turn so a sync pass can enqueue its whole fleet before the
+  // first batch is selected. Without this, each call from a loop would pump a
+  // one-account batch immediately.
+  if (!gatewayOpenPumpRunning && !gatewayOpenPumpTimer) {
+    gatewayOpenPumpTimer = setTimeout(() => {
+      gatewayOpenPumpTimer = null;
+      pumpGatewayOpenQueue();
+    }, 0);
+  }
+}
+
+function pumpGatewayOpenQueue() {
+  if (gatewayOpenPumpRunning || gatewayOpenPumpTimer || gatewayOpenQueue.size === 0) {
+    return;
+  }
+
+  gatewayOpenPumpRunning = true;
+  const batch = Array.from(gatewayOpenQueue.values()).slice(
+    0,
+    GATEWAY_OPEN_BATCH_SIZE,
+  );
+  try {
+    for (const entry of batch) {
+      gatewayOpenQueue.delete(entry.accountId);
+      pendingReconnects.delete(entry.accountId);
+      try {
+        openSession(entry.accountId, entry.accountName, entry.token);
+      } catch (error: any) {
+        // A synchronous constructor failure must not strand the rest of the
+        // fleet or leave this account marked as permanently connecting.
+        gatewayStatus.set(entry.accountId, "dead");
+        gatewayOpenQueue.set(entry.accountId, entry);
+        logFn(
+          `GATEWAY OPEN ERR: ${entry.accountName}: ${error?.message || error}`,
+        );
+      }
+    }
+  } finally {
+    gatewayOpenPumpRunning = false;
+  }
+
+  if (gatewayOpenQueue.size > 0) {
+    const delay =
+      GATEWAY_OPEN_BATCH_DELAY_MIN_MS +
+      Math.random() *
+        (GATEWAY_OPEN_BATCH_DELAY_MAX_MS - GATEWAY_OPEN_BATCH_DELAY_MIN_MS);
+    logFn(
+      `GATEWAY QUEUE: opened ${batch.length} account(s); ` +
+        `${gatewayOpenQueue.size} waiting, next batch in ${Math.round(delay / 1000)}s`,
+    );
+    gatewayOpenPumpTimer = setTimeout(() => {
+      gatewayOpenPumpTimer = null;
+      pumpGatewayOpenQueue();
+    }, delay);
+  }
+}
+
+function removeQueuedGatewayOpen(accountId: string) {
+  gatewayOpenQueue.delete(accountId);
+}
+
 async function syncSessions() {
   try {
     const accounts = await storage.getAccounts();
@@ -1211,22 +1298,24 @@ async function syncSessions() {
       ? accounts.filter((a) => a.status === "Connected")
       : [];
 
-    // Stagger new session openings — 500ms apart — prevents thundering herd
-    // on DNS + TCP when 100+ tokens all connect at once (e.g. after a restart).
-    // 100 accounts = ~50s to fully open; well within Discord's identify rate limit.
-    // IMPORTANT: skip accounts that already have a pending reconnect timer — the
-    // close handler set up an exponential backoff for them. Opening a new session
-    // here would bypass that backoff entirely and cause rapid drop/reconnect loops.
-    const toOpen = connected.filter((acc) => !sessions.has(acc.id) && !pendingReconnects.has(acc.id));
-    for (let i = 0; i < toOpen.length; i++) {
-      const acc = toOpen[i];
-      if (i > 0) await new Promise((r) => setTimeout(r, 500));
-      openSession(acc.id, acc.name, acc.token);
+    // All opens go through one bounded queue. This includes the first fleet
+    // startup, so 550 accounts become batches of 10 with a 2–3s pause between
+    // batches instead of a loop that eventually creates 550 live sockets.
+    for (const acc of connected) {
+      if (!sessions.has(acc.id) && !pendingReconnects.has(acc.id)) {
+        scheduleGatewayOpen(acc.id, acc.name, acc.token);
+      }
     }
 
     for (const [id] of sessions) {
       const still = connected.find((a) => a.id === id);
       if (!still) closeSession(id);
+    }
+
+    // Drop queued opens for accounts that were disconnected while waiting.
+    const connectedIds = new Set(connected.map((acc) => acc.id));
+    for (const accountId of gatewayOpenQueue.keys()) {
+      if (!connectedIds.has(accountId)) removeQueuedGatewayOpen(accountId);
     }
   } catch (e: any) {
     logFn(`BOT SYNC ERROR: ${e.message}`);
@@ -1236,6 +1325,10 @@ async function syncSessions() {
 function openSession(accountId: string, accountName: string, token: string) {
   if (sessions.has(accountId)) return;
 
+  // This guard also protects callers outside the normal queue path (for
+  // example a reconnect timer firing at the same time as a sync tick).
+  gatewayOpenQueue.delete(accountId);
+  pendingReconnects.delete(accountId);
   gatewayStatus.set(accountId, "connecting");
   broadcastFn("gatewayStatus", { accountId, status: "connecting" });
 
@@ -1262,12 +1355,17 @@ function openSession(accountId: string, accountName: string, token: string) {
     token,
     ws,
     heartbeatTimer: null,
+    initialHeartbeatTimer: null,
     heartbeatAcked: true,
-    sessionId: null,
-    resumeUrl: null,
-    seq: null,
+    // Preserve resume state on the new socket as well. If a resumed socket
+    // later drops, its close handler must still be able to save the session.
+    sessionId: resumeData?.sessionId ?? null,
+    resumeUrl: resumeData?.resumeUrl ?? null,
+    seq: resumeData?.seq ?? null,
     reconnectTimer: null,
+    identifyTimer: null,
     helloTimer: null,
+    shouldReconnect: true,
     isReady: false,
     guildIds: [],
     discordUserId: null,
@@ -1325,9 +1423,24 @@ function openSession(accountId: string, accountName: string, token: string) {
     // status can still be Connected while a reconnect is backing off.
     recomputeAccountRotations(accountId).catch(() => {});
 
+    // closeSession() marks deliberate shutdowns so they cannot be mistaken for
+    // a network failure and re-added to the reconnect queue.
+    if (!session.shouldReconnect) {
+      gatewayStatus.delete(accountId);
+      return;
+    }
+
     const fatal = [4004, 4010, 4011, 4012, 4013, 4014];
     if (!fatal.includes(code)) {
-      // Save RESUME data so the next connection can restore without re-IDENTIFY
+      const isGoingAway = code === 1001;
+      if (isGoingAway) {
+        logFn(
+          `GATEWAY GOING AWAY: ${accountName} — preserving session for RESUME`,
+        );
+      }
+      // Save RESUME data so the next connection can restore without re-IDENTIFY.
+      // Code 1001 is expected to use this path; only an explicit invalid-session
+      // response or a fatal auth code should discard it.
       if (session.sessionId && session.resumeUrl) {
         pendingResumes.set(accountId, {
           sessionId: session.sessionId,
@@ -1342,7 +1455,12 @@ function openSession(accountId: string, accountName: string, token: string) {
       const MAX_CONCURRENT_RECONNECTS = 30;
       const attempt = retryCount.get(accountId) || 0;
       retryCount.set(accountId, attempt + 1);
-      let backoff = Math.min(5000 * Math.pow(2, attempt), 90000) + Math.random() * 3000;
+      // Going Away is transient and should recover sooner, but still uses the
+      // same exponential backoff and jitter to avoid synchronized retries.
+      const baseBackoff = isGoingAway ? 2000 : 5000;
+      let backoff =
+        Math.min(baseBackoff * Math.pow(2, attempt), 90000) +
+        Math.random() * 3000;
       if (pendingReconnects.size >= MAX_CONCURRENT_RECONNECTS) {
         // Add extra spread: each account above the cap adds 500ms
         const overage = pendingReconnects.size - MAX_CONCURRENT_RECONNECTS;
@@ -1355,8 +1473,9 @@ function openSession(accountId: string, accountName: string, token: string) {
       session.reconnectTimer = setTimeout(async () => {
         pendingReconnects.delete(accountId);
         const acc = await storage.getAccount(accountId);
-        if (acc && acc.status === "Connected")
-          openSession(accountId, accountName, token);
+        if (acc && acc.status === "Connected") {
+          scheduleGatewayOpen(accountId, accountName, acc.token || token);
+        }
       }, backoff);
     } else {
       logFn(
@@ -1374,9 +1493,15 @@ function openSession(accountId: string, accountName: string, token: string) {
 
 function closeSession(accountId: string) {
   const s = sessions.get(accountId);
-  if (!s) return;
+  if (!s) {
+    removeQueuedGatewayOpen(accountId);
+    pendingReconnects.delete(accountId);
+    return;
+  }
+  s.shouldReconnect = false;
   clearTimers(s);
   pendingReconnects.delete(accountId);
+  removeQueuedGatewayOpen(accountId);
   // Release per-session Maps immediately so GC can reclaim the memory.
   // Critical at 1000+ accounts — each Map can hold thousands of entries.
   s.guildNames.clear();
@@ -1400,9 +1525,17 @@ function clearTimers(s: GatewaySession) {
     clearInterval(s.heartbeatTimer);
     s.heartbeatTimer = null;
   }
+  if (s.initialHeartbeatTimer) {
+    clearTimeout(s.initialHeartbeatTimer);
+    s.initialHeartbeatTimer = null;
+  }
   if (s.reconnectTimer) {
     clearTimeout(s.reconnectTimer);
     s.reconnectTimer = null;
+  }
+  if (s.identifyTimer) {
+    clearTimeout(s.identifyTimer);
+    s.identifyTimer = null;
   }
   if (s.helloTimer) {
     clearTimeout(s.helloTimer);
@@ -1416,6 +1549,17 @@ function clearTimers(s: GatewaySession) {
 function send(s: GatewaySession, payload: any) {
   if (s.ws.readyState === WebSocket.OPEN) {
     s.ws.send(JSON.stringify(payload));
+    return true;
+  }
+  return false;
+}
+
+function sendHeartbeat(s: GatewaySession) {
+  // Mark the heartbeat as awaiting ACK only when it was actually written to
+  // the socket. A socket that is already closing should be handled by its
+  // close event, not create a false heartbeat timeout.
+  if (send(s, { op: 1, d: s.seq })) {
+    s.heartbeatAcked = false;
   }
 }
 
@@ -1444,16 +1588,26 @@ function handlePayload(p: any, s: GatewaySession) {
 
   switch (p.op) {
     case 10: {
-      // HELLO — start heartbeat, then identify after a human-plausible delay
-      const interval = p.d.heartbeat_interval;
+      // HELLO — start heartbeat before authentication. Discord expects the
+      // first heartbeat at a jittered point in the interval, followed by a
+      // heartbeat every interval until an ACK arrives.
+      const interval = Number(p.d?.heartbeat_interval);
+      if (!Number.isFinite(interval) || interval <= 0) {
+        logFn(`INVALID HELLO: ${s.accountName} — missing heartbeat interval`);
+        s.ws.terminate();
+        return;
+      }
       // Connection is alive — cancel the hung-handshake watchdog
       if (s.helloTimer) { clearTimeout(s.helloTimer); s.helloTimer = null; }
+      if (s.heartbeatTimer) clearInterval(s.heartbeatTimer);
+      if (s.initialHeartbeatTimer) clearTimeout(s.initialHeartbeatTimer);
+      if (s.identifyTimer) clearTimeout(s.identifyTimer);
       s.heartbeatAcked = true;
       // Initial heartbeat jitter — exactly what Discord's own client does
-      setTimeout(
-        () => send(s, { op: 1, d: s.seq }),
-        Math.floor(Math.random() * interval),
-      );
+      s.initialHeartbeatTimer = setTimeout(() => {
+        s.initialHeartbeatTimer = null;
+        sendHeartbeat(s);
+      }, Math.floor(Math.random() * interval));
 
       s.heartbeatTimer = setInterval(() => {
         if (!s.heartbeatAcked) {
@@ -1461,15 +1615,16 @@ function handlePayload(p: any, s: GatewaySession) {
           s.ws.terminate();
           return;
         }
-        s.heartbeatAcked = false;
-        send(s, { op: 1, d: s.seq });
+        sendHeartbeat(s);
       }, interval);
 
       // Behavioral sequencing: real clients take 1–4 s between receiving HELLO
       // and sending IDENTIFY — they load JS bundles, initialise crypto, etc.
       // Sending IDENTIFY instantly is a well-known bot tell.
       const identifyDelay = 1200 + Math.random() * 2800;
-      setTimeout(() => {
+      s.identifyTimer = setTimeout(() => {
+        s.identifyTimer = null;
+        if (s.ws.readyState !== WebSocket.OPEN) return;
         // RESUME if we have a saved session, else full IDENTIFY
         const savedResume = pendingResumes.get(s.accountId);
         if (savedResume && savedResume.sessionId) {
@@ -1547,7 +1702,7 @@ function handlePayload(p: any, s: GatewaySession) {
       break;
 
     case 1: // HEARTBEAT request from server
-      send(s, { op: 1, d: s.seq });
+      sendHeartbeat(s);
       break;
 
     case 7: // RECONNECT
@@ -1557,6 +1712,12 @@ function handlePayload(p: any, s: GatewaySession) {
     case 9: // INVALID SESSION — clear stale resume data then re-identify
       pendingResumes.delete(s.accountId); // force fresh IDENTIFY on reconnect
       retryCount.delete(s.accountId); // reset backoff for clean reconnect
+      // The current session is no longer resumable. Clear the copy held on the
+      // live session too, otherwise the following close event would save the
+      // invalid session back into pendingResumes.
+      s.sessionId = null;
+      s.resumeUrl = null;
+      s.seq = null;
       setTimeout(() => s.ws.close(4000), 1000 + Math.random() * 4000);
       break;
 
@@ -2962,12 +3123,16 @@ async function gatewayWatchdog() {
     if (orphans.length > 0) {
       const batch = orphans.slice(0, WATCHDOG_MAX_RECOVERY_PER_TICK);
       logFn(
-        `WATCHDOG: forcing recovery for ${batch.length}/${orphans.length} orphaned session(s) — staggered 500ms apart`,
+        `WATCHDOG: queueing recovery for ${batch.length}/${orphans.length} orphaned session(s)`,
       );
-      // Stagger openings to avoid a simultaneous DNS/TCP burst
+      // The shared gateway queue applies the 10-account batch limit and
+      // 2–3-second inter-batch delay to these recovery attempts as well.
       for (let i = 0; i < batch.length; i++) {
         const acc = batch[i];
-        setTimeout(() => openSession(acc.id, acc.name, acc.token), i * 500);
+        setTimeout(
+          () => scheduleGatewayOpen(acc.id, acc.name, acc.token),
+          i * 500,
+        );
       }
       broadcastFn("gatewayAlert", {
         type: "recovery",
