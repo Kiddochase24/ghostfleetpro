@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useWorkspace } from "@/context/workspace";
 import { useToast } from "@/hooks/use-toast";
+import { appUrl } from "@/lib/queryClient";
 import { TerminalSquare, Plus, LogIn, Eye, EyeOff, Loader2, Shield, Lock, Unlock } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
@@ -29,7 +30,7 @@ export default function WorkspaceGate() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("/api/workspaces", {
+      const res = await fetch(appUrl("/api/workspaces"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim(), password: password || undefined }),
@@ -48,7 +49,7 @@ export default function WorkspaceGate() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("/api/workspaces/login", {
+      const res = await fetch(appUrl("/api/workspaces/login"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim(), password: password || undefined }),
