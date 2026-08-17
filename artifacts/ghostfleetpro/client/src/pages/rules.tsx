@@ -423,6 +423,10 @@ export default function Rules() {
     const payload = {
       ...form,
       delayMs: form.delayMode === "custom" ? form.delayMs : (DELAY_PRESETS.find(d => d.value === form.delayMode)?.ms || 0),
+      // Keyword rules always pass through the AI relevance gate after the
+      // keyword pre-filter. Keep the persisted flag truthful for older
+      // clients, even though the server treats this behavior as mandatory.
+      aiFilterEnabled: form.triggerCondition === "keyword",
     };
     if (editId) {
       updateMutation.mutate({ id: editId, ...payload });
@@ -490,6 +494,13 @@ export default function Rules() {
                       <span className="text-xs px-1.5 py-0.5 rounded font-mono flex-shrink-0" style={{ background: "rgba(16,185,129,0.1)", color: "#34d399", border: "1px solid rgba(16,185,129,0.2)" }}>
                         {rule.triggerCondition}
                       </span>
+                       {rule.triggerCondition === "keyword" && (
+                         <span className="text-[10px] px-1.5 py-0.5 rounded font-display font-bold tracking-wide flex-shrink-0"
+                           style={{ background: "rgba(96,165,250,0.1)", color: "#93c5fd", border: "1px solid rgba(96,165,250,0.22)" }}
+                           title="Keyword matches are checked by the AI relevance classifier">
+                           AI
+                         </span>
+                       )}
                     </div>
                     <button
                       onClick={() => toggleMutation.mutate({ id: rule.id, isActive: !rule.isActive })}
@@ -636,13 +647,48 @@ export default function Rules() {
                       </div>
                     </div>
                     {form.triggerCondition === "keyword" && (
-                      <div>
+                       <>
+                       <div>
                         <label className="text-xs font-display tracking-widest uppercase mb-2 block" style={{ color: "rgba(16,185,129,0.6)" }}>Keyword / Phrase</label>
                         <input value={form.keyword} onChange={e => setForm(f => ({ ...f, keyword: e.target.value }))}
                           placeholder="E.g. help, support, price"
                           className="w-full px-4 py-3 rounded-xl text-sm outline-none font-mono"
                           style={{ background: "rgba(0,0,0,0.5)", border: "1px solid rgba(16,185,129,0.2)", color: "#f0fdf4" }} />
                       </div>
+                       <div className="flex items-start gap-3 rounded-xl p-4"
+                         style={{ background: "rgba(96,165,250,0.08)", border: "1px solid rgba(96,165,250,0.24)" }}>
+                         <div className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
+                           style={{ background: "rgba(96,165,250,0.12)", border: "1px solid rgba(96,165,250,0.2)" }}>
+                           <Zap className="w-4 h-4" style={{ color: "#60a5fa" }} />
+                         </div>
+                         <div>
+                           <div className="text-xs font-display font-bold tracking-widest uppercase mb-1" style={{ color: "#93c5fd" }}>
+                             AI Classifier · Always On
+                           </div>
+                           <p className="text-xs leading-relaxed" style={{ color: "rgba(191,219,254,0.72)" }}>
+                             The keyword is only the first filter. Every keyword match is checked for real relevance before Ghost Fleet replies.
+                             OpenAI is used when configured; a local classifier keeps the rule working if the AI service is unavailable.
+                           </p>
+                         </div>
+                       </div>
+                       </>
+                     )}
+                     {form.triggerCondition === "any" && (
+                       <div className="flex items-start gap-3 rounded-xl p-4"
+                         style={{ background: "rgba(251,191,36,0.06)", border: "1px solid rgba(251,191,36,0.2)" }}>
+                         <div className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
+                           style={{ background: "rgba(251,191,36,0.1)", border: "1px solid rgba(251,191,36,0.18)" }}>
+                           <MessageSquare className="w-4 h-4" style={{ color: "#fbbf24" }} />
+                         </div>
+                         <div>
+                           <div className="text-xs font-display font-bold tracking-widest uppercase mb-1" style={{ color: "#fbbf24" }}>
+                             Any Message · Direct Trigger
+                           </div>
+                           <p className="text-xs leading-relaxed" style={{ color: "rgba(253,230,138,0.68)" }}>
+                             This mode responds to every message in the selected channels. It does not use the keyword AI relevance gate.
+                           </p>
+                         </div>
+                       </div>
                     )}
                   </div>
                 )}

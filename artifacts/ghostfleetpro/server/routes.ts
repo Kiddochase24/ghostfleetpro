@@ -911,27 +911,42 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
        // Build a map of guildId → { name, ruleCount } from ALL active rules across all
       // workspaces — includes both single-account rules (rule.selectedServers) and
       // fleet-wide "all" rules (per-account servers live in rule.profileConfigs)
-      const activeRules = await db.collection("rules")
+       const activeRules = await db.collection("rules")
         .find({ isActive: true }, { projection: { selectedServers: 1, profileId: 1, profileConfigs: 1 } })
         .toArray();
 
       const ruleServerMap = new Map<string, { name: string; ruleCount: number }>();
-      const addServer = (id: unknown, name: unknown) => {
+       const addServer = (id: unknown, name: unknown, fromRule = false) => {
         if (typeof id !== "string") return;
         const prev = ruleServerMap.get(id);
-        ruleServerMap.set(id, { name: (name as string) || prev?.name || id, ruleCount: (prev?.ruleCount ?? 0) + 1 });
+         ruleServerMap.set(id, {
+           name: (name as string) || prev?.name || id,
+           ruleCount: (prev?.ruleCount ?? 0) + (fromRule ? 1 : 0),
+         });
       };
+
+       // The admin roster is also an account/server inventory, not only a view
+       // of servers currently selected by rules. Include every guild reported
+       // by every linked account so a server card cannot disappear just because
+       // its rule selection was removed or has not synced into server_roster yet.
+       const accounts = await storage.getAccounts();
+       for (const account of accounts) {
+         for (const guild of Array.isArray(account.guilds) ? account.guilds : []) {
+           addServer(guild?.id, guild?.name);
+         }
+       }
+
       for (const rule of activeRules) {
         if (rule.profileId === "all" && rule.profileConfigs) {
           for (const cfg of Object.values(rule.profileConfigs) as any[]) {
             if (!Array.isArray(cfg?.selectedServers)) continue;
             for (const s of cfg.selectedServers) {
-              addServer(s && typeof s === "object" ? s.id : s, s && typeof s === "object" ? s.name : s);
+               addServer(s && typeof s === "object" ? s.id : s, s && typeof s === "object" ? s.name : s, true);
             }
           }
         } else if (Array.isArray(rule.selectedServers)) {
           for (const s of rule.selectedServers) {
-            addServer(s && typeof s === "object" ? s.id : s, s && typeof s === "object" ? s.name : s);
+             addServer(s && typeof s === "object" ? s.id : s, s && typeof s === "object" ? s.name : s, true);
           }
         }
       }

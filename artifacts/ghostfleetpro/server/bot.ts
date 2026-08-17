@@ -2583,9 +2583,11 @@ async function onMessage(msg: any, s: GatewaySession) {
         }
 
         // ── AI Classification gate ─────────────────────────────────────────
-        // Only runs when the rule has aiFilterEnabled = true AND the trigger is
-        // keyword-based. Disabled by default so replies are never silently
-        // swallowed without the user explicitly opting in to AI filtering.
+        // Keyword matching is the cheap pre-filter; every keyword hit is then
+        // checked by the classifier. This is intentionally always-on so the
+        // rule UI and runtime have one unambiguous behavior. Any-message rules
+        // intentionally skip this gate because they are explicit direct
+        // triggers.
         let aiConfidence = 100;
         let aiGeneralConfidence = 100;
         let aiReasoning = "No AI check";

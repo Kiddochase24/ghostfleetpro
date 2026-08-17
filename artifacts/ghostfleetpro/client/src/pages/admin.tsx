@@ -373,6 +373,7 @@ export default function Admin() {
   // Roster state
   const [roster, setRoster] = useState<ServerSummary[]>([]);
   const [rosterLoading, setRosterLoading] = useState(false);
+  const [rosterError, setRosterError] = useState("");
   const [rosterSearch, setRosterSearch] = useState("");
 
   const fetchLicenses = useCallback(async (key: string) => {
@@ -400,12 +401,33 @@ export default function Admin() {
 
   const fetchRoster = useCallback(async (key: string) => {
     setRosterLoading(true);
+    setRosterError("");
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 15_000);
     try {
-      const res = await fetch(appUrl("/api/admin/server-roster"), { headers: { "x-admin-key": key } });
-      if (!res.ok) return;
-      const data = await res.json();
+      const res = await fetch(appUrl("/api/admin/server-roster"), {
+        headers: { "x-admin-key": key },
+        signal: controller.signal,
+      });
+      const data = await res.json().catch(() => null);
+      if (res.status === 403) {
+        setAuthenticated(false);
+        setAuthError("Admin session expired.");
+        setRosterError("Admin session expired. Authenticate again to load the server roster.");
+        localStorage.removeItem(STORAGE_KEY);
+        return;
+      }
+      if (!res.ok || !Array.isArray(data)) {
+        setRosterError(data?.error || `Roster request failed (${res.status}).`);
+        return;
+      }
       setRoster(data);
-    } catch {} finally {
+    } catch (error: any) {
+      setRosterError(error?.name === "AbortError"
+        ? "The roster request timed out. The server is still recovering account data."
+        : "Network error — could not load the server roster.");
+    } finally {
+      window.clearTimeout(timeout);
       setRosterLoading(false);
     }
   }, []);
@@ -420,7 +442,7 @@ export default function Admin() {
 
   useEffect(() => {
     if (authenticated && tab === "roster") fetchRoster(adminKey);
-  }, [tab, authenticated]);
+  }, [tab, authenticated, adminKey, fetchRoster]);
 
   useEffect(() => {
     if (!authenticated || tab !== "roster") return;
@@ -715,6 +737,17 @@ export default function Admin() {
                 </button>
               </div>
 
+              {rosterError && (
+                <div className="mb-4 flex items-start gap-2 rounded-xl px-4 py-3 text-xs"
+                  style={{ background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.2)", color: "#fca5a5" }}>
+                  <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-display font-semibold mb-0.5">Could not load server roster</div>
+                    <div style={{ color: "rgba(252,165,165,0.75)" }}>{rosterError}</div>
+                  </div>
+                </div>
+              )}
+
               {/* Server cards */}
               {rosterLoading && roster.length === 0 ? (
                 <div className="flex items-center justify-center py-20">
@@ -724,7 +757,7 @@ export default function Admin() {
                 <div className="text-center py-20 rounded-2xl" style={{ background: "rgba(0,0,0,0.3)", border: "1px solid rgba(16,185,129,0.08)" }}>
                   <Server className="w-8 h-8 mx-auto mb-3" style={{ color: "rgba(16,185,129,0.3)" }} />
                   <p className="text-sm font-display" style={{ color: "rgba(255,255,255,0.35)" }}>
-                    {roster.length === 0 ? "No servers tracked yet — accounts will populate this once they connect to Discord." : "No servers match your filter."}
+                    {rosterError ? "Fix the request above, then press Refresh." : roster.length === 0 ? "No servers found on the linked accounts yet." : "No servers match your filter."}
                   </p>
                 </div>
               ) : (
