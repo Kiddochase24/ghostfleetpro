@@ -130,6 +130,13 @@ const responseCache = new Map<string, {
   pending?: Promise<any>;
 }>();
 
+/** Delete every cache entry whose key starts with the given prefix. */
+function bustCache(prefix: string) {
+  for (const key of responseCache.keys()) {
+    if (key.startsWith(prefix)) responseCache.delete(key);
+  }
+}
+
 async function cachedResponse<T>(
   key: string,
   ttlMs: number,
@@ -421,8 +428,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // === ACCOUNTS ===
   app.get("/api/accounts", async (req, res) => {
     const wsId = getWorkspaceId(req);
-    const accs = await storage.getAccounts(wsId);
-    res.json(accs);
+    const key = `accounts:${wsId ?? "all"}`;
+    res.json(await cachedResponse(key, 15_000, () => storage.getAccounts(wsId)));
   });
 
   app.post("/api/accounts", async (req, res) => {
@@ -468,6 +475,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       logToConsole(`ACCOUNT LINKED: ${name} (@${user.username}) | ${guilds.length} servers | ${latency}ms`, wsId);
       broadcast("accountLinked", { id: user.id, name, username: user.username });
+      bustCache("accounts:");
       refreshSessions();
 
       res.status(201).json({ ...acc, guilds });
@@ -480,6 +488,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.delete("/api/accounts/:id", async (req, res) => {
     const wsId = getWorkspaceId(req);
     await storage.deleteAccount(req.params.id);
+    bustCache("accounts:");
     logToConsole(`ACCOUNT REMOVED: ${req.params.id}`, wsId);
     res.status(204).send();
   });
@@ -497,6 +506,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const guilds = await guildsRes.json() as any[];
       await storage.updateAccountGuilds(acc.id, guilds);
       await storage.updateAccountStatus(acc.id, "Connected");
+      bustCache("accounts:");
       logToConsole(`GUILDS REFRESHED: ${acc.name} | ${guilds.length} servers`);
       res.json({ guilds });
     } catch (err: any) {
@@ -526,7 +536,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // === RULES ===
   app.get("/api/rules", async (req, res) => {
     const wsId = getWorkspaceId(req);
-    res.json(await storage.getRules(wsId));
+    const key = `rules:${wsId ?? "all"}`;
+    res.json(await cachedResponse(key, 15_000, () => storage.getRules(wsId)));
   });
 
   app.post("/api/rules", async (req, res) => {
@@ -569,6 +580,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         aiFilterEnabled: body.aiFilterEnabled ?? false,
       });
       invalidateRulesCache();
+      bustCache("rules:");
       logToConsole(`RULE CREATED: "${rule.label}" (ID: ${rule.id})`, wsId);
       broadcast("ruleCreated", rule);
       res.status(201).json(rule);
@@ -596,6 +608,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       const updated = await storage.updateRule(id, body);
       invalidateRulesCache();
+      bustCache("rules:");
       logToConsole(`RULE UPDATED: ID ${id} "${updated.label}"`);
       res.json(updated);
       // Fire-and-forget: any newly checked server gets joinedAt = right now,
@@ -611,6 +624,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const wsId = getWorkspaceId(req);
     await storage.deleteRule(id);
     invalidateRulesCache();
+    bustCache("rules:");
     logToConsole(`RULE DELETED: ID ${id}`, wsId);
     res.status(204).send();
     syncRosterFromRules().catch((e) => logToConsole(`ROSTER SYNC ERR: ${e.message}`));

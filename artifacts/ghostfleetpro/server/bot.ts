@@ -10,15 +10,11 @@ let openai: InstanceType<typeof OpenAI> | null = null;
 let _openaiKey: string | undefined;
 
 function getOpenAIClient(): InstanceType<typeof OpenAI> | null {
-  const apiKey =
-    process.env.OPENAI_API_KEY ||
-    process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
-  // Re-create client if the key changed (e.g. env var was updated)
   if (openai && apiKey === _openaiKey) return openai;
   try {
-    const baseURL = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || undefined;
-    openai = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
+    openai = new OpenAI({ apiKey });
     _openaiKey = apiKey;
     return openai;
   } catch (_) {
@@ -549,11 +545,9 @@ Return JSON only.`,
         reasoning: String(result.reasoning || "No reasoning provided").substring(0, 200),
       };
     } catch (e: any) {
-      // If it's a "not configured" / network error, fall through to local classifier
-      const isProxyError = e.status === 404 || e.message?.includes("not configured") || e.message?.includes("ECONNREFUSED");
-      if (!isProxyError) {
-        logFn(`AI CLASSIFY ERR: ${e.message} — using local classifier`);
-      }
+      // Always log the real error so pm2 logs show exactly why AI failed.
+      // Previously 404s were swallowed silently — that hid key/model mismatches on the VPS.
+      logFn(`AI CLASSIFY ERR: ${e.message ?? String(e)} — falling back to local classifier`);
     }
   }
 
@@ -1212,6 +1206,20 @@ export function initBotEngine(
 ) {
   broadcastFn = broadcast;
   logFn = log;
+
+  // Show AI classifier status on startup so pm2 logs make it obvious whether
+  // OpenAI is active or the local fallback is being used.
+  {
+    const directKey = process.env.OPENAI_API_KEY;
+    const integrationKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
+    if (directKey) {
+      logFn(`AI CLASSIFIER: active — using OPENAI_API_KEY (direct)`);
+    } else if (integrationKey) {
+      logFn(`AI CLASSIFIER: active — using AI_INTEGRATIONS_OPENAI_API_KEY (Replit proxy)`);
+    } else {
+      logFn(`AI CLASSIFIER: ⚠ no API key found — all classifications will use local fallback`);
+    }
+  }
 
   // Load persisted dev-mode flag, then start the sync loop.
   // syncSessions inside the interval handles late-arriving accounts on its own,
