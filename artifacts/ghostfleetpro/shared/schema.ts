@@ -68,6 +68,7 @@ export interface Rule {
   replyInThread: boolean;
   adminGuardEnabled: boolean;
   adminRoleId: string | null;
+  aiFilterEnabled: boolean;
 }
 
 export interface History {

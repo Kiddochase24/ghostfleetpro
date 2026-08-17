@@ -694,6 +694,9 @@ const pendingReconnects = new Set<string>();
 const GATEWAY_OPEN_BATCH_SIZE = 1;
 const GATEWAY_OPEN_BATCH_DELAY_MIN_MS = 5000;
 const GATEWAY_OPEN_BATCH_DELAY_MAX_MS = 7000;
+const RECONNECT_BACKOFF_MS = [7000, 15000, 30000, 60000, 90000];
+const RECONNECT_JITTER_MS = 3000;
+const TCP_KEEPALIVE_DELAY_MS = 30000;
 const gatewayOpenQueue = new Map<
   string,
   { accountId: string; accountName: string; token: string }
@@ -717,6 +720,8 @@ let logFn: (msg: string, wsId?: number) => void = () => {};
 // cache instantly) propagate within one message cycle even without a bust.
 const rosterStatusCache = new Map<string, { status: string; ts: number }>();
 const ROSTER_CACHE_TTL_MS = 10_000;
+// Throttle map for rotation-queue log lines (once per account+guild per 60 s)
+const rotationBlockLog = new Map<string, number>();
 
 async function getRosterStatus(
   accountId: string,
@@ -803,29 +808,51 @@ export type RosterHealth = {
 };
 
 const tokenHealth = new Map<string, { valid: boolean; checkedAt: number }>();
+const tokenHealthInFlight = new Map<string, Promise<boolean | null>>();
 const TOKEN_HEALTH_TTL_MS = 60_000;
+const TOKEN_HEALTH_TIMEOUT_MS = 5_000;
 
 async function checkAccountToken(account: any): Promise<boolean | null> {
   const cached = tokenHealth.get(account.id);
   if (cached && Date.now() - cached.checkedAt < TOKEN_HEALTH_TTL_MS) return cached.valid;
 
+  const running = tokenHealthInFlight.get(account.id);
+  if (running) return running;
+
+  const check = (async (): Promise<boolean | null> => {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), TOKEN_HEALTH_TIMEOUT_MS);
+      try {
+        const response = await fetch(`${DISCORD_API}/users/@me`, {
+          headers: { ...makeHeaders(getFingerprint(account.id)), Authorization: account.token },
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          tokenHealth.set(account.id, { valid: true, checkedAt: Date.now() });
+          return true;
+        }
+        if (response.status === 401 || response.status === 403) {
+          tokenHealth.set(account.id, { valid: false, checkedAt: Date.now() });
+          await storage.updateAccountStatus(account.id, "Disconnected");
+          return false;
+        }
+        return cached?.valid ?? null;
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {
+      // A transient network failure is not proof that a token is invalid.
+      return cached?.valid ?? null;
+    }
+  })();
+  tokenHealthInFlight.set(account.id, check);
   try {
-    const response = await fetch(`${DISCORD_API}/users/@me`, {
-      headers: { ...makeHeaders(getFingerprint(account.id)), Authorization: account.token },
-    });
-    if (response.ok) {
-      tokenHealth.set(account.id, { valid: true, checkedAt: Date.now() });
-      return true;
+    return await check;
+  } finally {
+    if (tokenHealthInFlight.get(account.id) === check) {
+      tokenHealthInFlight.delete(account.id);
     }
-    if (response.status === 401 || response.status === 403) {
-      tokenHealth.set(account.id, { valid: false, checkedAt: Date.now() });
-      await storage.updateAccountStatus(account.id, "Disconnected");
-      return false;
-    }
-    return cached?.valid ?? null;
-  } catch {
-    // A transient network failure is not proof that a token is invalid.
-    return cached?.valid ?? false;
   }
 }
 
@@ -841,13 +868,17 @@ async function getRosterHealth(
   const inServer = !!session?.guildIds.includes(entry.guildId);
   const tokenValid = account ? await checkAccountToken(account) : false;
   const accountStatus = account?.status ?? "Missing";
-  const healthy = accountStatus === "Connected" && tokenValid === true && gatewayReady && inServer;
+  // tokenValid === null means "couldn't verify right now" (network/timeout) — treat as
+  // healthy so a transient HTTP blip doesn't permanently freeze the rotation.
+  // tokenValid === false means the token was actively rejected (401) — that IS unhealthy.
+  const tokenOk = tokenValid !== false;
+  const healthy = accountStatus === "Connected" && tokenOk && gatewayReady && inServer;
   const reason = !account
     ? "Account missing"
     : accountStatus !== "Connected"
       ? `Account ${accountStatus.toLowerCase()}`
-        : tokenValid !== true
-        ? "Token invalid or not verified"
+        : tokenValid === false
+        ? "Token rejected (401)"
         : !gatewayReady
           ? "Gateway not ready"
           : !inServer
@@ -1307,6 +1338,15 @@ function removeQueuedGatewayOpen(accountId: string) {
 async function syncSessions() {
   try {
     const accounts = await storage.getAccounts();
+    // Keep every account name available to the dashboard, including accounts
+    // that are disconnected or waiting for a retry. The gateway status API
+    // should never look empty merely because a socket is currently down.
+    for (const acc of accounts) {
+      gatewayAccountNames.set(acc.id, acc.name);
+      if (acc.status !== "Connected" && !sessions.has(acc.id)) {
+        gatewayStatus.set(acc.id, "dead");
+      }
+    }
     // When fleet is disabled, treat as if no accounts are connected so existing
     // sessions get closed by the reconciliation loop below.
     const connected = isFleetActive()
@@ -1403,6 +1443,18 @@ function openSession(accountId: string, accountName: string, token: string) {
   };
   sessions.set(accountId, session);
 
+  // Keep the underlying TCP connection active through NATs, firewalls, and
+  // idle proxy tunnels. Discord's gateway heartbeat is application-level and
+  // should not be the only thing keeping the transport alive.
+  ws.on("open", () => {
+    const socket = (ws as any)._socket as {
+      setKeepAlive?: (enable: boolean, initialDelay?: number) => void;
+      setNoDelay?: (noDelay?: boolean) => void;
+    } | undefined;
+    socket?.setKeepAlive?.(true, TCP_KEEPALIVE_DELAY_MS);
+    socket?.setNoDelay?.(true);
+  });
+
   // Guard: if the TCP connection hangs and Discord never sends HELLO (op 10),
   // the session would sit in "connecting" forever — heartbeat never starts,
   // no reconnect is ever triggered. Terminate after 45s if no HELLO arrives.
@@ -1483,19 +1535,19 @@ function openSession(accountId: string, accountName: string, token: string) {
           seq: session.seq,
         });
       }
-      // Exponential backoff: 5s → 10s → 20s → 40s → capped at 90s.
+       // Exponential backoff: 7s → 15s → 30s → 60s → capped at 90s.
       // When many accounts drop at once, spread reconnects by adding extra delay
       // proportional to the number already queued — prevents thundering-herd
       // reconnect storms from overwhelming the Discord gateway identify limit.
       const MAX_CONCURRENT_RECONNECTS = 30;
       const attempt = retryCount.get(accountId) || 0;
       retryCount.set(accountId, attempt + 1);
-      // Going Away is transient and should recover sooner, but still uses the
-      // same exponential backoff and jitter to avoid synchronized retries.
-      const baseBackoff = isGoingAway ? 2000 : 5000;
-      let backoff =
-        Math.min(baseBackoff * Math.pow(2, attempt), 90000) +
-        Math.random() * 3000;
+       // All transient close codes use the same backoff. Going Away is not
+       // exempt: a fleet-wide reconnect burst can turn a harmless network
+       // restart into another gateway identify storm.
+       let backoff =
+         RECONNECT_BACKOFF_MS[Math.min(attempt, RECONNECT_BACKOFF_MS.length - 1)] +
+         Math.random() * RECONNECT_JITTER_MS;
       if (pendingReconnects.size >= MAX_CONCURRENT_RECONNECTS) {
         // Add extra spread: each account above the cap adds 500ms
         const overage = pendingReconnects.size - MAX_CONCURRENT_RECONNECTS;
@@ -2420,8 +2472,18 @@ async function onMessage(msg: any, s: GatewaySession) {
     if (guildId) {
       const rStatus = await getRosterStatus(s.accountId, guildId);
       if (rStatus !== "active") {
-        if (rStatus !== "queued") {
-          // Log non-standard blocks so they're visible in the console
+        // Always log so the user can see why replies aren't firing.
+        // "queued" is the most common state (waiting for rotation to promote),
+        // so we log it at a lower rate to avoid spamming the console.
+        if (rStatus === "queued") {
+          // Rate-limit: log at most once per account+guild per 60s
+          const throttleKey = `rotlog:${s.accountId}:${guildId}`;
+          const lastLog = (rotationBlockLog.get(throttleKey) ?? 0);
+          if (Date.now() - lastLog > 60_000) {
+            rotationBlockLog.set(throttleKey, Date.now());
+            logFn(`ROTATION QUEUE [${rule.label}]: ${s.accountName} is queued (not yet active) in guild ${guildId} — run /api/admin/roster-sync to promote`);
+          }
+        } else {
           logFn(`ROTATION BLOCK [${rule.label}]: ${s.accountName} status="${rStatus}" in guild ${guildId} — skipping`);
         }
         continue;
@@ -2506,12 +2568,14 @@ async function onMessage(msg: any, s: GatewaySession) {
         }
 
         // ── AI Classification gate ─────────────────────────────────────────
-        // Only runs for keyword-triggered rules — "any" trigger skips AI check
+        // Only runs when the rule has aiFilterEnabled = true AND the trigger is
+        // keyword-based. Disabled by default so replies are never silently
+        // swallowed without the user explicitly opting in to AI filtering.
         let aiConfidence = 100;
         let aiGeneralConfidence = 100;
-        let aiReasoning = "No AI check (any-trigger rule)";
+        let aiReasoning = "No AI check";
         let aiIsCrypto = true;
-        if (rule.triggerCondition === "keyword" && triggerKeywords.length > 0) {
+        if (rule.aiFilterEnabled && rule.triggerCondition === "keyword" && triggerKeywords.length > 0) {
           const aiResult = await aiClassifyMessage(
             triggerContent,
             triggerKeywords,
@@ -2531,7 +2595,7 @@ async function onMessage(msg: any, s: GatewaySession) {
                 `AI FALLBACK [${ruleLabel}]: crypto=${aiConfidence}% but general issue=${aiGeneralConfidence}% ≥50% — allowing`,
               );
             } else {
-              // AI blocked — log locally only, no Telegram (saves AI credits, no noise)
+              // AI blocked — log with clear label so the user knows why
               logFn(
                 `⛔ AI BLOCKED [${ruleLabel}]: crypto=${aiConfidence}% general=${aiGeneralConfidence}% — ${aiReasoning}`,
               );
@@ -3119,6 +3183,7 @@ export function getGatewayStatus(): {
     ...gatewayStatus.keys(),
     ...gatewayOpenQueue.keys(),
     ...sessions.keys(),
+    ...gatewayAccountNames.keys(),
   ]);
   return Array.from(accountIds).map((accountId) => {
     const session = sessions.get(accountId);
@@ -3148,13 +3213,7 @@ function broadcastGatewayHealth() {
   const deadNames: string[] = [];
   for (const [id, st] of all) {
     if (st === "dead") {
-      // Find name from any active session or just use the id
-      for (const [, sess] of sessions) {
-        if ((sess as any).accountId === id) {
-          deadNames.push((sess as any).accountName);
-          break;
-        }
-      }
+      deadNames.push(gatewayAccountNames.get(id) || id);
     }
   }
   broadcastFn("gatewayHealth", {
@@ -3197,8 +3256,8 @@ async function gatewayWatchdog() {
       logFn(
         `WATCHDOG: queueing recovery for ${batch.length}/${orphans.length} orphaned session(s)`,
       );
-      // The shared gateway queue applies the 10-account batch limit and
-      // 2–3-second inter-batch delay to these recovery attempts as well.
+      // The shared gateway queue applies the one-account batch limit and
+      // 5–7-second inter-batch delay to these recovery attempts as well.
       for (let i = 0; i < batch.length; i++) {
         const acc = batch[i];
         setTimeout(

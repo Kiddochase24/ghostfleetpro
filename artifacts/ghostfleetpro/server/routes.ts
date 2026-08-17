@@ -15,7 +15,15 @@ const wsClients = new Set<WebSocket>();
 function broadcast(event: string, data: any) {
   const msg = JSON.stringify({ event, data, ts: Date.now() });
   wsClients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
+    if (client.readyState !== WebSocket.OPEN) return;
+    // Never let a slow admin/dashboard browser build an unbounded outbound
+    // buffer or throw while the gateway is broadcasting recovery events.
+    if (client.bufferedAmount > 1024 * 1024) {
+      try { client.terminate(); } catch {}
+      wsClients.delete(client);
+      return;
+    }
+    try { client.send(msg); } catch { wsClients.delete(client); }
   });
 }
 
@@ -116,6 +124,44 @@ setInterval(() => broadcast("sysStats", sysStats), 2000);
 
 // Console buffer
 const consoleBuffer: string[] = [];
+const responseCache = new Map<string, {
+  value?: any;
+  expiresAt: number;
+  pending?: Promise<any>;
+}>();
+
+async function cachedResponse<T>(
+  key: string,
+  ttlMs: number,
+  load: () => Promise<T>,
+): Promise<T> {
+  const now = Date.now();
+  const existing = responseCache.get(key);
+  if (existing?.value !== undefined && existing.expiresAt > now) {
+    return existing.value as T;
+  }
+  if (existing?.pending) return existing.pending as Promise<T>;
+
+  const pending = load().then((value) => {
+    responseCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+    return value;
+  }).finally(() => {
+    const current = responseCache.get(key);
+    if (current?.pending === pending) {
+      responseCache.set(key, {
+        value: current.value,
+        expiresAt: current.expiresAt,
+      });
+    }
+  });
+  responseCache.set(key, {
+    value: existing?.value,
+    expiresAt: existing?.expiresAt ?? 0,
+    pending,
+  });
+  return pending;
+}
+
 function logToConsole(msg: string, workspaceId?: number) {
   const ts = new Date().toISOString();
   const wsTag = workspaceId ? `[WS:${workspaceId}] ` : "";
@@ -157,6 +203,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   wss.on("connection", (ws) => {
     wsClients.add(ws);
     (ws as any).isAlive = true;
+    const socket = (ws as any)._socket as {
+      setKeepAlive?: (enable: boolean, initialDelay?: number) => void;
+      setNoDelay?: (noDelay?: boolean) => void;
+    } | undefined;
+    socket?.setKeepAlive?.(true, 30000);
+    socket?.setNoDelay?.(true);
 
     // Low-level pong (keeps connection alive through proxies)
     ws.on("pong", () => { (ws as any).isAlive = true; });
@@ -514,6 +566,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         botMode: body.botMode || false,
         workspaceId: wsId,
         profileConfigs,
+        aiFilterEnabled: body.aiFilterEnabled ?? false,
       });
       invalidateRulesCache();
       logToConsole(`RULE CREATED: "${rule.label}" (ID: ${rule.id})`, wsId);
@@ -566,7 +619,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // === HISTORY ===
   app.get("/api/history", async (req, res) => {
     const wsId = getWorkspaceId(req);
-    res.json(await storage.getHistory(wsId));
+    const key = `history:${wsId ?? "all"}`;
+    res.json(await cachedResponse(key, 3000, () => storage.getHistory(wsId)));
   });
 
   // === CONFIG ===
@@ -589,7 +643,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // === STATS ===
   app.get("/api/stats", async (req, res) => {
     const wsId = getWorkspaceId(req);
-    const stats = await storage.getStats(wsId);
+    const key = `stats:${wsId ?? "all"}`;
+    const stats = await cachedResponse(key, 2000, () => storage.getStats(wsId));
     res.json({ ...stats, ...sysStats });
   });
 
@@ -928,6 +983,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       res.json({ ok: true });
     } catch (e: any) {
       res.status(400).json({ error: e.message });
+    }
+  });
+
+  // Force a full roster re-sync + rotation recompute across all guilds.
+  // Useful when accounts are stuck as "queued" after a fresh deployment.
+  app.post("/api/admin/roster-sync", async (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+      await syncRosterFromRules();
+      logToConsole("ROSTER: manual sync triggered via admin endpoint");
+      res.json({ ok: true, message: "Roster sync complete — rotations recomputed." });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 

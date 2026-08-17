@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { AppLayout } from "@/components/layout";
 import { useWorkspace } from "@/context/workspace";
+import { appUrl } from "@/lib/queryClient";
 import { format } from "date-fns";
 import {
   Activity, ShieldCheck, MessageSquare, Database,
@@ -100,7 +101,7 @@ export default function Dashboard() {
   const queryClient = useQueryClient();
   const toggleDevMode = useMutation({
     mutationFn: async (enabled: boolean) => {
-      const r = await fetch("/api/dev-mode", {
+      const r = await fetch(appUrl("/api/dev-mode"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled }),
@@ -128,7 +129,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     // Fetch initial console buffer
-    fetch("/api/console")
+    fetch(appUrl("/api/console"))
       .then(r => r.json())
       .then((lines: string[]) => setConsoleLines(lines))
       .catch(() => {});
@@ -136,6 +137,7 @@ export default function Dashboard() {
     let pingInterval: ReturnType<typeof setInterval> | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let pongWatchdog: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempt = 0;
     let closed = false;
 
     const connect = () => {
@@ -157,6 +159,7 @@ export default function Dashboard() {
       };
 
       ws.onopen = () => {
+        reconnectAttempt = 0;
         setWsStatus("connected");
         ping();
         if (pingInterval) clearInterval(pingInterval);
@@ -164,16 +167,23 @@ export default function Dashboard() {
       };
 
       ws.onclose = () => {
+        if (wsRef.current !== ws) return;
         setWsStatus("disconnected");
         if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
         if (pongWatchdog) { clearTimeout(pongWatchdog); pongWatchdog = null; }
         if (!closed) {
           if (reconnectTimer) clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(connect, 2000);
+          const backoff = [2000, 4000, 8000, 15000, 30000][
+            Math.min(reconnectAttempt, 4)
+          ];
+          reconnectAttempt += 1;
+          reconnectTimer = setTimeout(connect, backoff + Math.random() * 1000);
         }
       };
 
-      ws.onerror = () => setWsStatus("disconnected");
+      ws.onerror = () => {
+        if (wsRef.current === ws) setWsStatus("disconnected");
+      };
 
       ws.onmessage = (e) => {
         let msg: any;

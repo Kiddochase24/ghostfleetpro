@@ -244,6 +244,7 @@ export class MongoStorage implements IStorage {
       replyInThread:      rule.replyInThread ?? false,
       adminGuardEnabled:  rule.adminGuardEnabled ?? false,
       adminRoleId:        rule.adminRoleId ?? null,
+      aiFilterEnabled:    rule.aiFilterEnabled ?? false,
     };
     await db.collection("rules").insertOne({ ...doc });
     return doc;

@@ -7,7 +7,7 @@ import {
   Trash2, Copy, CheckCircle2, RefreshCw, ExternalLink,
   Download, Upload
 } from "lucide-react";
-import { apiRequest, getWorkspaceId } from "@/lib/queryClient";
+import { apiRequest, appUrl, getWorkspaceId } from "@/lib/queryClient";
 import { motion, AnimatePresence } from "framer-motion";
 import { format } from "date-fns";
 
@@ -72,7 +72,7 @@ function LicenseManager() {
   const { data: licenses = [], isLoading, refetch } = useQuery<License[]>({
     queryKey: ["/api/admin/licenses", adminKey],
     queryFn: async () => {
-      const res = await fetch("/api/admin/licenses", { headers: { "x-admin-key": adminKey } });
+      const res = await fetch(appUrl("/api/admin/licenses"), { headers: { "x-admin-key": adminKey } });
       if (res.status === 403) throw new Error("Invalid admin key");
       return res.json();
     },
@@ -82,7 +82,7 @@ function LicenseManager() {
 
   const revokeMutation = useMutation({
     mutationFn: async (code: string) => {
-      await fetch(`/api/admin/licenses/${code}`, { method: "DELETE", headers: { "x-admin-key": adminKey } });
+      await fetch(appUrl(`/api/admin/licenses/${code}`), { method: "DELETE", headers: { "x-admin-key": adminKey } });
     },
     onSuccess: () => { refetch(); toast({ title: "License revoked" }); },
   });

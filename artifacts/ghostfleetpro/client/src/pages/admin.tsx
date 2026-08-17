@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { appUrl } from "@/lib/queryClient";
 import {
   Shield, Key, Plus, Trash2, Copy, Check, RefreshCw, Lock, LogOut,
   Loader2, Tag, Server, Users, ArrowRight, RotateCcw, XCircle, Ban,
@@ -89,7 +90,7 @@ function LicenseRow({ lic, adminKey, onRevoke, onCopy }: {
   const revoke = async () => {
     if (!confirm(`Revoke license ${lic.code}?`)) return;
     setRevoking(true);
-    await fetch(`/api/admin/licenses/${lic.code}`, {
+    await fetch(appUrl(`/api/admin/licenses/${lic.code}`), {
       method: "DELETE",
       headers: { "x-admin-key": adminKey },
     });
@@ -377,7 +378,7 @@ export default function Admin() {
   const fetchLicenses = useCallback(async (key: string) => {
     setLoading(true);
     try {
-      const res = await fetch("/api/admin/licenses", { headers: { "x-admin-key": key } });
+      const res = await fetch(appUrl("/api/admin/licenses"), { headers: { "x-admin-key": key } });
       if (res.status === 403) {
         setAuthenticated(false);
         setAuthError("Invalid admin key.");
@@ -400,7 +401,7 @@ export default function Admin() {
   const fetchRoster = useCallback(async (key: string) => {
     setRosterLoading(true);
     try {
-      const res = await fetch("/api/admin/server-roster", { headers: { "x-admin-key": key } });
+      const res = await fetch(appUrl("/api/admin/server-roster"), { headers: { "x-admin-key": key } });
       if (!res.ok) return;
       const data = await res.json();
       setRoster(data);
@@ -444,7 +445,7 @@ export default function Admin() {
   const generate = async () => {
     setGenerating(true); setNewCodes([]);
     try {
-      const res = await fetch("/api/admin/licenses/generate", {
+      const res = await fetch(appUrl("/api/admin/licenses/generate"), {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-admin-key": adminKey },
         body: JSON.stringify({ count: genCount, label: genLabel }),

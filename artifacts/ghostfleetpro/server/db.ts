@@ -30,9 +30,12 @@ export async function getDb(): Promise<Db> {
 async function ensureIndexes(db: Db) {
   await db.collection("workspaces").createIndex({ name: 1 }, { unique: true });
   await db.collection("accounts").createIndex({ workspaceId: 1 });
+  await db.collection("accounts").createIndex({ workspaceId: 1, status: 1 });
   await db.collection("rules").createIndex({ workspaceId: 1 });
+  await db.collection("rules").createIndex({ workspaceId: 1, isActive: 1 });
   await db.collection("history").createIndex({ workspaceId: 1 });
   await db.collection("history").createIndex({ ts: -1 });
+  await db.collection("history").createIndex({ workspaceId: 1, ts: -1 });
   await db.collection("licenses").createIndex({ fingerprint: 1 });
   // Cross-process dedup: TTL index auto-purges entries after 10 minutes.
   // _id is the dedup key (msgId:ruleId). Insert is the lock — duplicate
