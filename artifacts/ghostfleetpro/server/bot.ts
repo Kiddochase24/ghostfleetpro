@@ -1437,7 +1437,7 @@ function openSession(accountId: string, accountName: string, token: string) {
     wsUrl = base + "?v=10&encoding=json";
   }
   const fp = getFingerprint(accountId);
-  const wsAgent = getWsAgent();
+  const wsAgent = getWsAgent(accountId);
   const ws = new WebSocket(wsUrl, {
     headers: {
       "User-Agent": fp.userAgent,

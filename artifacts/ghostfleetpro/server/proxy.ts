@@ -42,21 +42,43 @@ function buildSocksUrl(): string {
 // Returned value is passed directly to `new WebSocket(url, { agent })`.
 // The ws package forwards it to the underlying TLS/TCP handshake.
 
-let _wsAgent: any;
+// When PROXY_USERNAME_TEMPLATE is set (must contain "{session}"), each account
+// gets its own agent with a per-account session id in the username — most
+// residential proxy providers (IPRoyal, Decodo/Smartproxy, Oxylabs, Webshare…)
+// use this pattern to pin each session to a DIFFERENT sticky exit IP.
+// Example: PROXY_USERNAME_TEMPLATE="myuser-session-{session}"
+// Without the template, all accounts share one agent (single exit IP).
+const _wsAgents = new Map<string, any>();
 
-export function getWsAgent(): any {
+function buildSocksUrlFor(sessionKey: string | undefined): string {
+  const host = process.env.PROXY_HOST!;
+  const port = process.env.PROXY_PORT!;
+  const template = process.env.PROXY_USERNAME_TEMPLATE;
+  const pass = process.env.PROXY_PASSWORD;
+  if (template && sessionKey) {
+    const user = template.replace("{session}", sessionKey);
+    return `socks5://${encodeURIComponent(user)}:${encodeURIComponent(pass ?? "")}@${host}:${port}`;
+  }
+  return buildSocksUrl();
+}
+
+export function getWsAgent(accountId?: string): any {
   if (!isProxyConfigured()) return undefined;
-  if (!_wsAgent) {
-    if (!SocksProxyAgent) {
-      SocksProxyAgent = require("socks-proxy-agent").SocksProxyAgent;
-    }
-    _wsAgent = new SocksProxyAgent(buildSocksUrl(), {
+  if (!SocksProxyAgent) {
+    SocksProxyAgent = require("socks-proxy-agent").SocksProxyAgent;
+  }
+  const usePerAccount = !!(process.env.PROXY_USERNAME_TEMPLATE && accountId);
+  const key = usePerAccount ? accountId! : "__shared__";
+  let agent = _wsAgents.get(key);
+  if (!agent) {
+    agent = new SocksProxyAgent(buildSocksUrlFor(usePerAccount ? accountId : undefined), {
       keepAlive: true,
       // Reconnect quickly if the proxy socket drops
       timeout: 30_000,
     });
+    _wsAgents.set(key, agent);
   }
-  return _wsAgent;
+  return agent;
 }
 
 // ─── Global fetch proxy ───────────────────────────────────────────────────────
