@@ -205,8 +205,28 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   setInterval(runHistoryPurge, 24 * 60 * 60 * 1000);
 
   // === WEBSOCKET ===
-  const wsPath = `${(process.env.BASE_PATH || "/").replace(/\/+$/, "")}/ws` || "/ws";
-  const wss = new WebSocketServer({ server: httpServer, path: wsPath });
+  // Accept both the artifact-prefixed path and root /ws.  The VPS is commonly
+  // reverse-proxied at the domain root while Replit forwards /ghostfleetpro/ws;
+  // accepting both keeps the browser app socket alive in either deployment.
+  const configuredBase = (process.env.BASE_PATH || "/").replace(/\/+$/, "");
+  const wsPaths = new Set([
+    `${configuredBase || ""}/ws`,
+    "/ws",
+  ]);
+  const wss = new WebSocketServer({ noServer: true });
+  httpServer.on("upgrade", (req, socket, head) => {
+    let pathname = "/";
+    try {
+      pathname = new URL(req.url || "/", "http://localhost").pathname.replace(/\/+$/, "") || "/";
+    } catch {
+      socket.destroy();
+      return;
+    }
+    if (!wsPaths.has(pathname)) return;
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  });
   wss.on("connection", (ws) => {
     wsClients.add(ws);
     (ws as any).isAlive = true;
@@ -918,8 +938,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
        // Recompute each visible guild before returning it so an old active row
        // cannot remain displayed as primary while a healthy queued account waits.
-      const guildIds = [...ruleServerMap.keys()];
-       await Promise.all(guildIds.map((id) => recomputeRotation(id)));
+       const guildIds = [...ruleServerMap.keys()];
+       // Recomputing can perform Discord token checks with a 5s timeout per
+       // account. Do it in the background so a slow/disconnected gateway never
+       // makes the admin roster appear empty or hang indefinitely.
+       void Promise.all(guildIds.map((id) => recomputeRotation(id))).catch((e: any) => {
+         logToConsole(`ROSTER VIEW REFRESH ERR: ${e.message}`);
+       });
       const rosterDocs = guildIds.length > 0
         ? await db.collection("server_roster").find({ guildId: { $in: guildIds } }).sort({ joinedAt: 1 }).toArray()
         : [];
@@ -936,7 +961,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
        const response = guildIds.map(guildId => {
         const meta    = ruleServerMap.get(guildId)!;
          const rawEntries = (byGuild.get(guildId) ?? []).map(({ _id, ...rest }) => rest);
-         const healthMapPromise = getRosterHealthSnapshot(rawEntries);
+          // Use cached/session health for the first paint. Token probes happen
+          // in the background rotation pass and the next 15s refresh will show
+          // the updated health without blocking the server list.
+          const healthMapPromise = getRosterHealthSnapshot(rawEntries, { verifyTokens: false });
          const active = rawEntries.filter((entry: any) => entry.status === "active").length;
         return {
           guildId,

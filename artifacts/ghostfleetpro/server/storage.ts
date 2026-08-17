@@ -143,13 +143,28 @@ export class MongoStorage implements IStorage {
   async getAccounts(workspaceId?: number): Promise<Account[]> {
     const db = await getDb();
     const filter = workspaceId ? { workspaceId } : {};
-    const docs = await db.collection("accounts").find(filter).sort({ lastSeen: -1 }).toArray();
+    // Legacy VPS documents may still contain Discord's large features,
+    // permissions, icon, and banner fields. Project only the fields the app
+    // actually uses so one stale document cannot recreate the heap pressure
+    // before the startup migration finishes.
+    const projection = {
+      id: 1, workspaceId: 1, name: 1, token: 1, status: 1, avatar: 1,
+      username: 1, discriminator: 1, lastSeen: 1,
+      "guilds.id": 1, "guilds.name": 1,
+    };
+    const docs = await db.collection("accounts").find(filter, { projection }).sort({ lastSeen: -1 }).toArray();
     return docs.map(d => clean<Account>(d));
   }
 
   async getAccount(id: string): Promise<Account | undefined> {
     const db = await getDb();
-    const doc = await db.collection("accounts").findOne({ id });
+    const doc = await db.collection("accounts").findOne({ id }, {
+      projection: {
+        id: 1, workspaceId: 1, name: 1, token: 1, status: 1, avatar: 1,
+        username: 1, discriminator: 1, lastSeen: 1,
+        "guilds.id": 1, "guilds.name": 1,
+      },
+    });
     return doc ? clean<Account>(doc) : undefined;
   }
 

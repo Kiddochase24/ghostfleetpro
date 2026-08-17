@@ -853,6 +853,7 @@ async function checkAccountToken(account: any): Promise<boolean | null> {
 async function getRosterHealth(
   entry: any,
   accounts: Map<string, any>,
+  verifyToken = true,
 ): Promise<RosterHealth> {
   const account = accounts.get(entry.accountId);
   const session = sessions.get(entry.accountId);
@@ -860,7 +861,10 @@ async function getRosterHealth(
     gatewayStatus.get(entry.accountId) === "ready" &&
     session.isReady;
   const inServer = !!session?.guildIds.includes(entry.guildId);
-  const tokenValid = account ? await checkAccountToken(account) : false;
+  const cachedToken = account ? tokenHealth.get(entry.accountId)?.valid ?? null : false;
+  const tokenValid = account && verifyToken
+    ? await checkAccountToken(account)
+    : cachedToken;
   const accountStatus = account?.status ?? "Missing";
   // tokenValid === null means "couldn't verify right now" (network/timeout) — treat as
   // healthy so a transient HTTP blip doesn't permanently freeze the rotation.
@@ -891,13 +895,16 @@ async function getRosterHealth(
   };
 }
 
-export async function getRosterHealthSnapshot(entries: any[]): Promise<Map<string, RosterHealth>> {
+export async function getRosterHealthSnapshot(
+  entries: any[],
+  options: { verifyTokens?: boolean } = {},
+): Promise<Map<string, RosterHealth>> {
   const accounts = await storage.getAccounts();
   const accountMap = new Map(accounts.map((account) => [account.id, account]));
   const results = await Promise.all(
     entries.map(async (entry) => [
       `${entry.guildId}:${entry.accountId}`,
-      await getRosterHealth(entry, accountMap),
+      await getRosterHealth(entry, accountMap, options.verifyTokens !== false),
     ] as const),
   );
   return new Map(results);

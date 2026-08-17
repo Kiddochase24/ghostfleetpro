@@ -16,6 +16,7 @@ export async function getDb(): Promise<Db> {
     await client.connect();
     const db = client.db("ghostfleet");
     await ensureIndexes(db);
+    await migrateLegacyGuildDocuments(db);
     _db = db;
     console.log("[mongodb] connected to ghostfleet");
     return db;
@@ -50,6 +51,40 @@ async function ensureIndexes(db: Db) {
     { unique: true },
   );
   await db.collection("server_roster").createIndex({ guildId: 1, joinedAt: 1 });
+}
+
+// Older deployments persisted the complete Discord /users/@me/guilds payload,
+// which included very large permissions/features arrays. Migrate one document
+// at a time on startup so the fix does not depend on a manual VPS shell step.
+// The query becomes empty after the first successful run.
+async function migrateLegacyGuildDocuments(db: Db): Promise<void> {
+  const cursor = db.collection("accounts").find(
+    {
+      guilds: { $elemMatch: { $or: [
+        { features: { $exists: true } },
+        { permissions: { $exists: true } },
+        { icon: { $exists: true } },
+        { banner: { $exists: true } },
+      ] } },
+    },
+    { projection: { _id: 1, guilds: 1 } },
+  ).batchSize(1);
+  let migrated = 0;
+  for await (const doc of cursor) {
+    const guilds = Array.isArray(doc.guilds)
+      ? doc.guilds.map((guild: any) => ({ id: guild.id, name: guild.name }))
+      : [];
+    await db.collection("accounts").updateOne(
+      { _id: doc._id },
+      { $set: { guilds } },
+    );
+    migrated++;
+  }
+  if (migrated > 0) {
+    console.log(`[mongodb] slimmed guild data in ${migrated} legacy account document(s)`);
+  } else {
+    console.log("[mongodb] guild data migration complete — no legacy oversized documents found");
+  }
 }
 
 // Auto-increment helper using a counters collection

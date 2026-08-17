@@ -140,10 +140,19 @@ export default function Dashboard() {
     let reconnectAttempt = 0;
     let closed = false;
 
+    // A production VPS may serve the built app at / while Replit serves it
+    // under /ghostfleetpro/. Try the configured artifact path first, then the
+    // root path accepted by the server.
+    const base = (import.meta.env.BASE_URL || "/").replace(/\/+$/, "");
+    const wsPaths = Array.from(new Set([
+      `${base || ""}/ws`,
+      "/ws",
+    ]));
+    let wsPathIndex = 0;
+
     const connect = () => {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const base = (import.meta.env.BASE_URL || "/").replace(/\/+$/, "");
-      const ws = new WebSocket(`${protocol}//${window.location.host}${base}/ws`);
+      const ws = new WebSocket(`${protocol}//${window.location.host}${wsPaths[wsPathIndex]}`);
       wsRef.current = ws;
       setWsStatus("connecting");
 
@@ -172,6 +181,13 @@ export default function Dashboard() {
         if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
         if (pongWatchdog) { clearTimeout(pongWatchdog); pongWatchdog = null; }
         if (!closed) {
+          // If the first path is unavailable on a root-mounted VPS, try the
+          // alternate path before entering the normal reconnect backoff.
+          if (ws.readyState !== WebSocket.OPEN && wsPathIndex < wsPaths.length - 1) {
+            wsPathIndex += 1;
+            reconnectTimer = setTimeout(connect, 250);
+            return;
+          }
           if (reconnectTimer) clearTimeout(reconnectTimer);
           const backoff = [2000, 4000, 8000, 15000, 30000][
             Math.min(reconnectAttempt, 4)

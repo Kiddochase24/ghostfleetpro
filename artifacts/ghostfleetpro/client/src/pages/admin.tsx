@@ -299,7 +299,7 @@ function RosterCard({
                              event.stopPropagation();
                              setPromotingId(entry.accountId);
                              try {
-                               const response = await fetch(`/api/admin/server-roster/${server.guildId}/primary`, {
+                               const response = await fetch(appUrl(`/api/admin/server-roster/${server.guildId}/primary`), {
                                  method: "POST",
                                  headers: { "Content-Type": "application/json", "x-admin-key": adminKey },
                                  body: JSON.stringify({ accountId: entry.accountId }),
@@ -326,7 +326,7 @@ function RosterCard({
                             onClick={async (event) => {
                               event.stopPropagation();
                               try {
-                                const response = await fetch(`/api/admin/server-roster/${server.guildId}/primary`, {
+                                const response = await fetch(appUrl(`/api/admin/server-roster/${server.guildId}/primary`), {
                                   method: "DELETE",
                                   headers: { "x-admin-key": adminKey },
                                 });
