@@ -2954,8 +2954,10 @@ async function discordSend(
   // reading-pause + typing indicator is the single most effective anti-ban
   // measure — it makes the HTTP traffic pattern indistinguishable from a person.
   try {
-    // Reading pause: 0.8–3.5 s (scales weakly with trigger message length)
-    const readMs = 800 + Math.random() * 2700;
+    // Reading pause: 0.3–0.8 s. Kept short so total pre-send pacing (read +
+    // typing) stays around ~2 s while still looking human. rule.delayMs is
+    // applied separately and is the user-configurable per-rule delay.
+    const readMs = 300 + Math.random() * 500;
     await new Promise((r) => setTimeout(r, readMs));
 
     // Send typing indicator — tells Discord "a human is composing"
@@ -2964,12 +2966,13 @@ async function discordSend(
       headers: { ...reqHeaders, Authorization: token },
     });
 
-    // Typing duration: roughly proportional to reply length (≈ 200 ms/word)
+    // Typing duration: scales with reply length but capped at ~1.2 s so the
+    // whole read+typing window lands near 2 s max.
     const replyText = rule.message || "";
     const wordCount = Math.max(1, replyText.split(/\s+/).length);
     const typingMs = Math.min(
-      8000,
-      wordCount * (180 + Math.random() * 80) + Math.random() * 600,
+      1200,
+      wordCount * (90 + Math.random() * 40) + Math.random() * 250,
     );
     await new Promise((r) => setTimeout(r, typingMs));
   } catch {

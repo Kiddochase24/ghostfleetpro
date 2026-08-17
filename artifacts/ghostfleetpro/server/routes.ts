@@ -975,6 +975,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         byGuild.set(doc.guildId, arr);
       }
 
+      // Compute health for EVERY roster entry in a single pass. Previously this
+      // ran once per guild, and each call reloaded all accounts from Mongo — an
+      // N+1 explosion that made the roster endpoint time out on large fleets.
+      const allRawEntries = rosterDocs.map(({ _id, ...rest }: any) => rest);
+      const sharedHealth = await getRosterHealthSnapshot(allRawEntries, { verifyTokens: false });
+
       // Build response — every rule-active server is listed, even with 0 accounts
        const response = guildIds.map(guildId => {
         const meta    = ruleServerMap.get(guildId)!;
@@ -982,7 +988,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           // Use cached/session health for the first paint. Token probes happen
           // in the background rotation pass and the next 15s refresh will show
           // the updated health without blocking the server list.
-          const healthMapPromise = getRosterHealthSnapshot(rawEntries, { verifyTokens: false });
+          const healthMapPromise = Promise.resolve(sharedHealth);
          const active = rawEntries.filter((entry: any) => entry.status === "active").length;
         return {
           guildId,
