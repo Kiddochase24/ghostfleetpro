@@ -9,4 +9,5 @@
 - [Express logger body truncation](express-logger-truncation.md) — logger JSON.stringifys full response body; truncated to 500 chars to prevent pm2 log flooding.
 - [Invalid-token reconnect guard](gateway-invalid-token-reconnect.md) — REST-verify token before every reconnect; bust cache on unexpected close; keep pendingReconnects until decision.
 - [Classifier confidence + timeouts](classifier-and-timeouts.md) — don't divide confidence by keyword-list length; OpenAI classify + client apiRequest need hard timeouts; purge runs at boot.
+- [VPS deployment](vps-deployment.md) — prod runs on self-managed VPS via pm2 (nvm shell, push over SSH); not Replit Deployments.
 - [App WebSocket and Mongo deployment](app-websocket-and-mongo-deployment.md) — accept root and artifact WS paths; migrate and project legacy guild data at startup.
