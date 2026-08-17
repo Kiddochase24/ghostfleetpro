@@ -7,6 +7,19 @@ import { motion, AnimatePresence } from "framer-motion";
 
 type Mode = "choose" | "login" | "create";
 
+const WORKSPACE_REQUEST_TIMEOUT_MS = 15000;
+
+async function fetchWorkspaceRequest(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), WORKSPACE_REQUEST_TIMEOUT_MS);
+
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 export default function WorkspaceGate() {
   const { setWorkspace } = useWorkspace();
   const { toast } = useToast();
@@ -30,18 +43,21 @@ export default function WorkspaceGate() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(appUrl("/api/workspaces"), {
+      const res = await fetchWorkspaceRequest(appUrl("/api/workspaces"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim(), password: password || undefined }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) { setError(data.error || "Failed to create workspace"); setLoading(false); return; }
       setWorkspace({ id: data.id, name: data.name, createdAt: data.createdAt });
-    } catch {
-      setError("Network error. Please try again.");
+    } catch (err: any) {
+      setError(err?.name === "AbortError"
+        ? "The server took too long to respond. Check the VPS connection and try again."
+        : "Network error. Please try again.");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const handleLogin = async () => {
@@ -49,18 +65,21 @@ export default function WorkspaceGate() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(appUrl("/api/workspaces/login"), {
+      const res = await fetchWorkspaceRequest(appUrl("/api/workspaces/login"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim(), password: password || undefined }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) { setError(data.error || "Login failed"); setLoading(false); return; }
       setWorkspace({ id: data.id, name: data.name, createdAt: data.createdAt });
-    } catch {
-      setError("Network error. Please try again.");
+    } catch (err: any) {
+      setError(err?.name === "AbortError"
+        ? "The server took too long to respond. Check the VPS connection and try again."
+        : "Network error. Please try again.");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
