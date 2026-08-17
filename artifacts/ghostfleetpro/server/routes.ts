@@ -1041,6 +1041,48 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // ── Admin: one-time guild-data slim migration ────────────────────────────────
+  // Strips full Discord guild objects in MongoDB down to {id, name} pairs.
+  // Idempotent — safe to call multiple times.  Triggers the same logic that
+  // updateAccountGuilds() now enforces on every new save.
+  app.post("/api/admin/migrate-slim-guilds", async (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+      const { getDb } = await import("./db");
+      const db = await getDb();
+      const accounts = db.collection("accounts");
+      const cursor = accounts.find({});
+
+      let checked = 0, updated = 0, skipped = 0;
+      const bulkOps: any[] = [];
+
+      while (await cursor.hasNext()) {
+        const doc = await cursor.next();
+        if (!doc) continue;
+        checked++;
+        const guilds: any[] = doc.guilds ?? [];
+        if (!Array.isArray(guilds) || guilds.length === 0) { skipped++; continue; }
+        const needsSlim = guilds.some((g) => Object.keys(g).some((k) => k !== "id" && k !== "name"));
+        if (!needsSlim) { skipped++; continue; }
+        bulkOps.push({
+          updateOne: {
+            filter: { _id: doc._id },
+            update: { $set: { guilds: guilds.map((g: any) => ({ id: g.id, name: g.name })) } },
+          },
+        });
+        updated++;
+      }
+      await cursor.close();
+      if (bulkOps.length > 0) await accounts.bulkWrite(bulkOps, { ordered: false });
+
+      const msg = `Guild migration complete — checked: ${checked}, updated: ${updated}, skipped (already slim): ${skipped}`;
+      logToConsole(msg);
+      res.json({ ok: true, checked, updated, skipped, message: msg });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // Init bot engine with broadcast + console functions
   initBotEngine(broadcast, logToConsole);
   logToConsole("GHOST FLEET PRO — System online. All modules ready.");
