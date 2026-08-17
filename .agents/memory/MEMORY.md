@@ -1,3 +1,8 @@
 - [Ghost Fleet reply ownership](ghostfleet-reply-ownership.md) — roster promotion must require persisted account health and a live ready gateway session.
 - [Ghost Fleet artifact entrypoint](ghostfleet-artifact-entrypoint.md) — the runnable app lives under client/, while the artifact root may contain an unused placeholder tree.
 - [Gateway recovery session state](gateway-recovery.md) — preserve resume metadata across socket replacement, but clear every copy after INVALID_SESSION.
+- [Roster tokenValid health check](roster-health-tokenvalid.md) — use !== false (not === true) for token validity; null means unverifiable, not invalid.
+- [AI classifier gate](ai-classifier-gate.md) — AI filter runs on all keyword rules by default; blocks on <40% crypto AND <50% general confidence; aiFilterEnabled field exists but gate is always-on.
+- [VPS OOM — guild data bloat](vps-oom-guild-bloat.md) — full Discord guild objects (features[], permissions) caused heap OOM; storage now saves only {id,name}; existing DB docs need one-time migration.
+- [Stats/history cache TTLs](stats-history-cache.md) — cachedResponse TTLs must exceed the dashboard poll interval (5s); set to 30s.
+- [Express logger body truncation](express-logger-truncation.md) — logger JSON.stringifys full response body; truncated to 500 chars to prevent pm2 log flooding.

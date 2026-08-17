@@ -2575,7 +2575,7 @@ async function onMessage(msg: any, s: GatewaySession) {
         let aiGeneralConfidence = 100;
         let aiReasoning = "No AI check";
         let aiIsCrypto = true;
-        if (rule.aiFilterEnabled && rule.triggerCondition === "keyword" && triggerKeywords.length > 0) {
+        if (rule.triggerCondition === "keyword" && triggerKeywords.length > 0) {
           const aiResult = await aiClassifyMessage(
             triggerContent,
             triggerKeywords,
