@@ -7,4 +7,6 @@
 - [VPS OOM — guild data bloat](vps-oom-guild-bloat.md) — full Discord guild objects (features[], permissions) caused heap OOM; storage now saves only {id,name}; existing DB docs need one-time migration.
 - [Stats/history cache TTLs](stats-history-cache.md) — cachedResponse TTLs must exceed the dashboard poll interval (5s); set to 30s.
 - [Express logger body truncation](express-logger-truncation.md) — logger JSON.stringifys full response body; truncated to 500 chars to prevent pm2 log flooding.
+- [Invalid-token reconnect guard](gateway-invalid-token-reconnect.md) — REST-verify token before every reconnect; bust cache on unexpected close; keep pendingReconnects until decision.
+- [Classifier confidence + timeouts](classifier-and-timeouts.md) — don't divide confidence by keyword-list length; OpenAI classify + client apiRequest need hard timeouts; purge runs at boot.
 - [App WebSocket and Mongo deployment](app-websocket-and-mongo-deployment.md) — accept root and artifact WS paths; migrate and project legacy guild data at startup.

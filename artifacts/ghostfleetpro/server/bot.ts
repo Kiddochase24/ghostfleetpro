@@ -264,7 +264,7 @@ interface GatewaySession {
 }
 
 // ─── 24-hour purge — clears old history and orphaned roster entries ──────────
-setInterval(async () => {
+async function runStoragePurge() {
   try {
     const histDeleted = await storage.deleteOldHistory(24 * 60 * 60 * 1000);
     const rosterDeleted = await storage.purgeOrphanedRosterEntries();
@@ -272,7 +272,11 @@ setInterval(async () => {
   } catch (e: any) {
     logFn(`PURGE ERR: ${e.message}`);
   }
-}, 24 * 60 * 60 * 1000);
+}
+setInterval(runStoragePurge, 24 * 60 * 60 * 1000);
+// Run once shortly after boot too — a process that restarts more often than
+// every 24h (pm2 crash loops) would otherwise never purge and Mongo fills up.
+setTimeout(runStoragePurge, 60_000);
 
 // ─── First-message tracker — logs the first post by users who just joined ─────
 // key: `${accountId}:${guildId}:${userId}`, value: { guildName, joinedAt }
@@ -431,8 +435,13 @@ function localClassifyMessage(
   const matchedKeywords = lowerKeywords.filter((kw) => text.includes(kw));
   const keywordScore = matchedKeywords.length / Math.max(1, lowerKeywords.length);
 
-  // Confidence = keyword hit rate × issue signal strength
-  const confidence = issueScore > 0 ? Math.round(keywordScore * Math.min(100, issueScore * 25)) : 0;
+  // Confidence = issue signal strength when ANY keyword matched.
+  // Do NOT divide by total keyword count — rules with long keyword lists were
+  // getting near-zero confidence even for genuine issues that matched a keyword.
+  const confidence =
+    issueScore > 0 && matchedKeywords.length > 0
+      ? Math.min(100, issueScore * 25)
+      : 0;
 
   // Crypto detection
   const cryptoWords = ["crypto", "token", "coin", "wallet", "blockchain", "defi", "nft", "eth", "btc", "sol", "usdt", "usdc", "swap", "dex", "contract", "transaction", "tx"];
@@ -531,6 +540,11 @@ Return JSON only.`,
         ],
         response_format: { type: "json_object" },
         max_completion_tokens: 1000,
+      }, {
+        // Hard cap — a hung OpenAI request must never stall the per-channel
+        // send queue (which serialises every reply for that channel).
+        timeout: 15_000,
+        maxRetries: 0,
       });
 
       const raw = response.choices[0]?.message?.content;
@@ -801,13 +815,20 @@ export type RosterHealth = {
   reason: string;
 };
 
-const tokenHealth = new Map<string, { valid: boolean; checkedAt: number }>();
+const tokenHealth = new Map<string, { valid: boolean; checkedAt: number; token: string }>();
 const tokenHealthInFlight = new Map<string, Promise<boolean | null>>();
 const TOKEN_HEALTH_TTL_MS = 60_000;
 const TOKEN_HEALTH_TIMEOUT_MS = 5_000;
 
 async function checkAccountToken(account: any): Promise<boolean | null> {
-  const cached = tokenHealth.get(account.id);
+  // Cache entries are keyed to the token value — a replaced token must never
+  // inherit the old token's cached verdict (stale false blocks a fresh valid
+  // token; stale true lets a revoked one through).
+  let cached = tokenHealth.get(account.id);
+  if (cached && cached.token !== account.token) {
+    tokenHealth.delete(account.id);
+    cached = undefined;
+  }
   if (cached && Date.now() - cached.checkedAt < TOKEN_HEALTH_TTL_MS) return cached.valid;
 
   const running = tokenHealthInFlight.get(account.id);
@@ -823,11 +844,11 @@ async function checkAccountToken(account: any): Promise<boolean | null> {
           signal: controller.signal,
         });
         if (response.ok) {
-          tokenHealth.set(account.id, { valid: true, checkedAt: Date.now() });
+          tokenHealth.set(account.id, { valid: true, checkedAt: Date.now(), token: account.token });
           return true;
         }
         if (response.status === 401 || response.status === 403) {
-          tokenHealth.set(account.id, { valid: false, checkedAt: Date.now() });
+          tokenHealth.set(account.id, { valid: false, checkedAt: Date.now(), token: account.token });
           await storage.updateAccountStatus(account.id, "Disconnected");
           return false;
         }
@@ -1572,10 +1593,33 @@ function openSession(accountId: string, accountName: string, token: string) {
         `RECONNECT ${accountName} in ${Math.round(backoff / 1000)}s (attempt ${attempt + 1}, queue ${pendingReconnects.size})`,
       );
       pendingReconnects.add(accountId);
+      // An unexpected close (especially 1006) is evidence the token may have
+      // just been revoked — bust the cached health verdict so the reconnect
+      // timer performs a FRESH REST check instead of trusting a stale "valid".
+      tokenHealth.delete(accountId);
       session.reconnectTimer = setTimeout(async () => {
-        pendingReconnects.delete(accountId);
+        // Keep the pendingReconnects marker until the token check and the
+        // scheduling decision complete — deleting it up-front opened a window
+        // where the watchdog/syncSessions could queue an UNCHECKED open while
+        // the REST verification was still in flight.
         try {
           const acc = await storage.getAccount(accountId);
+          // A dead token can never complete a gateway handshake — verify it
+          // via REST before reconnecting. Without this, an invalid-token
+          // account closes with 1006 forever and hammers the gateway.
+          if (acc && acc.status === "Connected") {
+            const tokenOk = await checkAccountToken(acc);
+            if (tokenOk === false) {
+              logFn(
+                `⚠ TOKEN INVALID: ${accountName} — REST rejected token (401), not reconnecting`,
+              );
+              pendingResumes.delete(accountId);
+              retryCount.delete(accountId);
+              gatewayStatus.set(accountId, "dead");
+              broadcastGatewayHealth();
+              return;
+            }
+          }
           if (isFleetActive() && acc && acc.status === "Connected") {
             scheduleGatewayOpen(accountId, accountName, acc.token || token);
           } else if (!acc || acc.status !== "Connected") {
@@ -1592,6 +1636,8 @@ function openSession(accountId: string, accountName: string, token: string) {
             `RECONNECT LOOKUP ERR: ${accountName}: ${error?.message || error}`,
           );
           broadcastGatewayHealth();
+        } finally {
+          pendingReconnects.delete(accountId);
         }
       }, backoff);
     } else {

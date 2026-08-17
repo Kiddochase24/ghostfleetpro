@@ -32,15 +32,30 @@ export async function apiRequest(
   url: string,
   data?: unknown | undefined,
 ): Promise<Response> {
-  const res = await fetch(appUrl(url), {
-    method,
-    headers: {
-      ...(data ? { "Content-Type": "application/json" } : {}),
-      ...getWorkspaceHeaders(),
-    },
-    body: data ? JSON.stringify(data) : undefined,
-    credentials: "include",
-  });
+  // 30s hard timeout — a slow/hung server must surface an error instead of
+  // leaving buttons (e.g. "Update Rule") spinning forever.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  let res: Response;
+  try {
+    res = await fetch(appUrl(url), {
+      method,
+      headers: {
+        ...(data ? { "Content-Type": "application/json" } : {}),
+        ...getWorkspaceHeaders(),
+      },
+      body: data ? JSON.stringify(data) : undefined,
+      credentials: "include",
+      signal: controller.signal,
+    });
+  } catch (e: any) {
+    if (e?.name === "AbortError") {
+      throw new Error("Request timed out after 30s — the server may be overloaded. Try again.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 
   await throwIfResNotOk(res);
   return res;
