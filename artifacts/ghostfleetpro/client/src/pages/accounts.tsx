@@ -29,10 +29,12 @@ export default function Accounts() {
   const [showToken, setShowToken] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const { data: accounts = [], isLoading } = useQuery<Account[]>({
+  const accountsQuery = useQuery<Account[]>({
     queryKey: ["/api/accounts"],
     refetchInterval: 10000,
   });
+  const accounts = accountsQuery.data ?? [];
+  const { isLoading } = accountsQuery;
 
   const { data: gwStatus = [] } = useQuery<{ accountId: string; accountName: string; status: string }[]>({
     queryKey: ["/api/gateway/status"],
@@ -197,6 +199,22 @@ export default function Accounts() {
             {isLoading ? (
               <div className="flex items-center justify-center py-20" style={{ color: "rgba(16,185,129,0.4)" }}>
                 <Loader2 className="w-6 h-6 animate-spin mr-2" /> Loading nodes...
+              </div>
+            ) : accountsQuery.error ? (
+              <div className="rounded-2xl p-10 text-center" style={{ background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.2)" }}>
+                <XCircle className="w-10 h-10 mx-auto mb-3" style={{ color: "#f87171" }} />
+                <p className="font-display text-sm font-semibold mb-2" style={{ color: "#fca5a5" }}>Account API unavailable</p>
+                <p className="text-xs break-words" style={{ color: "rgba(255,255,255,0.45)" }}>
+                  {accountsQuery.error instanceof Error ? accountsQuery.error.message : "The VPS did not return account data."}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => accountsQuery.refetch()}
+                  className="mt-4 px-4 py-2 rounded-lg text-xs font-display"
+                  style={{ background: "rgba(239,68,68,0.12)", color: "#fca5a5", border: "1px solid rgba(239,68,68,0.2)" }}
+                >
+                  Retry
+                </button>
               </div>
             ) : accounts.length === 0 ? (
               <div className="rounded-2xl p-16 text-center" style={{ background: "rgba(0,0,0,0.3)", border: "1px dashed rgba(16,185,129,0.2)" }}>

@@ -119,6 +119,9 @@ async function collectSysStats() {
   };
 }
 
+// Populate immediately so a fresh production process does not report zeros
+// until the first interval fires.
+collectSysStats();
 setInterval(collectSysStats, 2000);
 setInterval(() => broadcast("sysStats", sysStats), 2000);
 

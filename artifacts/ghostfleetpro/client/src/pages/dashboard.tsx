@@ -92,7 +92,8 @@ function LiveBar({ label, value, color = "#10b981" }: any) {
 }
 
 export default function Dashboard() {
-  const { data: stats } = useQuery<any>({ queryKey: ["/api/stats"], refetchInterval: 3000 });
+  const statsQuery = useQuery<any>({ queryKey: ["/api/stats"], refetchInterval: 3000 });
+  const stats = statsQuery.data;
   const { data: history } = useQuery<any[]>({ queryKey: ["/api/history"], refetchInterval: 5000 });
   const { data: devMode } = useQuery<{ enabled: boolean; production: boolean }>({
     queryKey: ["/api/dev-mode"],
@@ -273,6 +274,33 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
+
+        {statsQuery.error && (
+          <div
+            className="mb-6 rounded-xl px-4 py-3 flex items-center justify-between gap-4"
+            style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)" }}
+          >
+            <div className="flex items-start gap-3 min-w-0">
+              <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" style={{ color: "#f87171" }} />
+              <div className="min-w-0">
+                <div className="text-xs font-display tracking-widest uppercase" style={{ color: "#f87171" }}>
+                  Dashboard API unavailable
+                </div>
+                <div className="text-xs mt-1 break-words" style={{ color: "rgba(255,255,255,0.5)" }}>
+                  {statsQuery.error instanceof Error ? statsQuery.error.message : "The VPS did not return system statistics."}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => statsQuery.refetch()}
+              className="flex-shrink-0 px-3 py-2 rounded-lg text-xs font-display"
+              style={{ background: "rgba(239,68,68,0.12)", color: "#fca5a5", border: "1px solid rgba(239,68,68,0.2)" }}
+            >
+              Retry
+            </button>
+          </div>
+        )}
 
         {/* Stats Grid */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">

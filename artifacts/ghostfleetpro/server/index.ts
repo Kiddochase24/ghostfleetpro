@@ -161,6 +161,6 @@ app.use((req, res, next) => {
   // Replace all your app.listen calls with this:
   const PORT = Number(process.env.PORT) || 5000;
   httpServer.listen(PORT, "0.0.0.0", () => {
-    log(`serving on port ${PORT}`);
+    log(`serving on port ${PORT} (env=${process.env.NODE_ENV || "development"}, base=${basePath})`);
   });
 })();
