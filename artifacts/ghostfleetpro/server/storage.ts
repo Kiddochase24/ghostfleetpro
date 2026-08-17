@@ -191,7 +191,11 @@ export class MongoStorage implements IStorage {
 
   async updateAccountGuilds(id: string, guilds: DiscordGuild[]): Promise<void> {
     const db = await getDb();
-    await db.collection("accounts").updateOne({ id }, { $set: { guilds } });
+    // Only persist id + name. Full Discord guild objects include huge features[]
+    // arrays and permissions strings that are never read back at runtime.
+    // Keeping the full objects was the primary cause of heap OOM on the VPS.
+    const slim = guilds.map((g) => ({ id: g.id, name: g.name }));
+    await db.collection("accounts").updateOne({ id }, { $set: { guilds: slim } });
   }
 
   async updateAccountStatus(id: string, status: string): Promise<void> {

@@ -84,7 +84,10 @@ app.use((req, res, next) => {
     if (path.startsWith("/api")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        // Truncate large responses so guild arrays / history blobs don't flood pm2 logs.
+        // Full payload is always available via MongoDB or the API directly.
+        const raw = JSON.stringify(capturedJsonResponse);
+        logLine += ` :: ${raw.length > 500 ? raw.slice(0, 500) + "…" : raw}`;
       }
 
       log(logLine);

@@ -620,7 +620,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/history", async (req, res) => {
     const wsId = getWorkspaceId(req);
     const key = `history:${wsId ?? "all"}`;
-    res.json(await cachedResponse(key, 3000, () => storage.getHistory(wsId)));
+    res.json(await cachedResponse(key, 30_000, () => storage.getHistory(wsId)));
   });
 
   // === CONFIG ===
@@ -644,7 +644,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/stats", async (req, res) => {
     const wsId = getWorkspaceId(req);
     const key = `stats:${wsId ?? "all"}`;
-    const stats = await cachedResponse(key, 2000, () => storage.getStats(wsId));
+    const stats = await cachedResponse(key, 30_000, () => storage.getStats(wsId));
     res.json({ ...stats, ...sysStats });
   });
 
