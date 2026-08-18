@@ -254,13 +254,6 @@ interface GatewaySession {
   sendProcessing: boolean;
   // Stable per-account browser fingerprint — varies between accounts
   fingerprint: ClientFingerprint;
-  // Anti-detection: timestamp when this session first became READY (not resumed).
-  // Used to enforce a warm-up quiet period for new connections so they don't
-  // immediately flood with activity — a primary ML detection signal.
-  connectReadyAt: number;
-  // Whether this session was restored via RESUME (vs fresh IDENTIFY).
-  // Resumed sessions skip telemetry + warm-up since the account already has history.
-  isResumed: boolean;
 }
 
 // ─── 24-hour purge — clears old history and orphaned roster entries ──────────
@@ -576,22 +569,11 @@ Return JSON only.`,
 const channelQueues = new Map<string, Promise<void>>();
 const CHANNEL_SEND_GAP_MS = 1300; // ~4.6 msg/5s — safely under Discord's 5/5s limit
 
-// ─── 403 channel blacklist — stops hammering channels we can't send to ───────
-// key: `${accountId}:${channelId}` → { failures, until }
+// ─── 403 channel reporting ───────────────────────────────────────────────────
+// Keep failure counts for diagnostics, but never use them to gate a reply.
 const channelBlacklist = new Map<string, { failures: number; until: number }>();
 const BLACKLIST_THRESHOLD = 3;       // 403s before we give up on a channel
 const BLACKLIST_DURATION_MS = 60 * 60 * 1000; // 1 hour cooldown
-
-function is403Blacklisted(accountId: string, channelId: string): boolean {
-  const key = `${accountId}:${channelId}`;
-  const entry = channelBlacklist.get(key);
-  if (!entry) return false;
-  if (Date.now() > entry.until) {
-    channelBlacklist.delete(key);
-    return false;
-  }
-  return entry.failures >= BLACKLIST_THRESHOLD;
-}
 
 function record403(accountId: string, channelId: string, accountName: string, channelName: string, guildName: string) {
   const key = `${accountId}:${channelId}`;
@@ -599,7 +581,7 @@ function record403(accountId: string, channelId: string, accountName: string, ch
   entry.failures += 1;
   if (entry.failures >= BLACKLIST_THRESHOLD) {
     entry.until = Date.now() + BLACKLIST_DURATION_MS;
-    logFn(`🚫 BLACKLISTED [${accountName}] in #${channelName} (${guildName}) — 403 x${entry.failures}, skipping for 1h`);
+    logFn(`⚠ 403 REPORT [${accountName}] in #${channelName} (${guildName}) — ${entry.failures} failures recorded; replies remain ungated`);
   }
   channelBlacklist.set(key, entry);
 }
@@ -721,36 +703,10 @@ let logFn: (msg: string, wsId?: number) => void = () => {};
 // via rule config", exactly as configured across the whole GhostFleet, ignoring
 // which workspace the rule/account belongs to.
 
-// ── Roster gating REMOVED ─────────────────────────────────────────────────
-// Ghost Fleet no longer consults `server_roster` at runtime. Reply eligibility
-// is decided purely by rule config + a live, ready gateway session. No DB read
-// and no queued/active decision sits on the message hot path any more.
-
-// An account is only allowed to own a roster slot or send a reply when both
-// persistence and the live gateway agree that it is usable.  Checking the
-// gateway session is important because the account document can remain
-// "Connected" for the duration of a reconnect backoff.
-async function isAccountReplyReady(
-  accountId: string,
-  guildId?: string,
-): Promise<boolean> {
-  const session = sessions.get(accountId);
-  if (
-    !session ||
-    gatewayStatus.get(accountId) !== "ready" ||
-    !session.isReady
-  ) {
-    return false;
-  }
-  if (guildId && !session.guildIds.includes(guildId)) return false;
-
-  try {
-    const account = await storage.getAccount(accountId);
-    return !!account && account.status === "Connected" && !!account.token;
-  } catch {
-    return false;
-  }
-}
+// ── Message gating ──────────────────────────────────────────────────────────
+// The roster and gateway health are not consulted on the message hot path.
+// Once a configured rule matches, keyword and AI classification are the only
+// content gates before the send attempt.
 
 // Roster rotation is disabled — kept as a no-op so existing call sites stay valid.
 async function recomputeAccountRotations(_accountId: string): Promise<void> {
@@ -961,7 +917,7 @@ function startAccountAutoRefresh() {
       const accounts = await storage.getAccounts();
       let refreshed = 0;
       for (const acc of accounts) {
-        if (acc.status !== "Connected" || !acc.token) continue;
+        if (!acc.token) continue;
         try {
           const accFp = getFingerprint(acc.id);
           const guildsRes = await fetch(`${DISCORD_API}/users/@me/guilds`, {
@@ -1167,10 +1123,10 @@ async function syncSessions() {
         gatewayStatus.set(acc.id, "dead");
       }
     }
-    // When fleet is disabled, treat as if no accounts are connected so existing
-    // sessions get closed by the reconciliation loop below.
+    // When the fleet is active, every stored account with a token remains in
+    // the session set. Account status/health must not gate reply attempts.
     const connected = isFleetActive()
-      ? accounts.filter((a) => a.status === "Connected")
+      ? accounts.filter((a) => !!a.token)
       : [];
 
     // All opens go through one bounded queue. This includes the first fleet
@@ -1258,8 +1214,6 @@ function openSession(accountId: string, accountName: string, token: string) {
     sendQueue: [],
     sendProcessing: false,
     fingerprint: fp,
-    connectReadyAt: 0,
-    isResumed: false,
   };
   sessions.set(accountId, session);
 
@@ -1388,25 +1342,9 @@ function openSession(accountId: string, accountName: string, token: string) {
         // the REST verification was still in flight.
         try {
           const acc = await storage.getAccount(accountId);
-          // A dead token can never complete a gateway handshake — verify it
-          // via REST before reconnecting. Without this, an invalid-token
-          // account closes with 1006 forever and hammers the gateway.
-          if (acc && acc.status === "Connected") {
-            const tokenOk = await checkAccountToken(acc);
-            if (tokenOk === false) {
-              logFn(
-                `⚠ TOKEN INVALID: ${accountName} — REST rejected token (401), not reconnecting`,
-              );
-              pendingResumes.delete(accountId);
-              retryCount.delete(accountId);
-              gatewayStatus.set(accountId, "dead");
-              broadcastGatewayHealth();
-              return;
-            }
-          }
-          if (isFleetActive() && acc && acc.status === "Connected") {
-            scheduleGatewayOpen(accountId, accountName, acc.token || token);
-          } else if (!acc || acc.status !== "Connected") {
+          if (isFleetActive() && acc?.token) {
+            scheduleGatewayOpen(accountId, accountName, acc.token);
+          } else if (!acc || !acc.token) {
             pendingResumes.delete(accountId);
             gatewayStatus.delete(accountId);
             gatewayAccountNames.delete(accountId);
@@ -1721,8 +1659,6 @@ async function onDispatch(type: string, d: any, s: GatewaySession) {
       s.sessionId = d.session_id;
       s.resumeUrl = d.resume_gateway_url;
       s.isReady = true;
-      s.isResumed = false;
-      s.connectReadyAt = Date.now();
       s.guildIds = (d.guilds || []).map((g: any) => g.id);
       s.discordUserId = d.user?.id ?? null;
       gatewayStatus.set(s.accountId, "ready");
@@ -1746,23 +1682,9 @@ async function onDispatch(type: string, d: any, s: GatewaySession) {
       // Seed admin guard role subscriptions after session is ready
       setTimeout(() => refreshAdminGuardSubscriptions().catch(() => {}), 3000);
 
-      // ─── New-account warm-up ─────────────────────────────────────────────
-      // Fresh IDENTIFY (not RESUME) = Discord's ML has no prior session history
-      // to compare against. We slow down the initial burst to look like a human
-      // who just opened Discord and is reading through their channels.
-      //
-      // The warm-up window is 90–150 s. During this window:
-      //   - OP14 guild subscriptions are sent slowly (no burst)
-      //   - Message replies are held (handled in discordSend via connectReadyAt)
-      //
-      // Old accounts with a RESUME skip this entirely — they already have
-      // established session trust with Discord.
-      const accountIdx = Array.from(sessions.keys()).indexOf(s.accountId) % 10;
-      const warmupBaseMs = 90_000 + Math.random() * 60_000; // 90–150 s
-      const op14DelayMs  = warmupBaseMs + accountIdx * 1500;
-
-      logFn(`🛡 WARM-UP: ${s.accountName} — OP14 in ${Math.round(op14DelayMs / 1000)}s`);
-      subscribeGuilds(s, op14DelayMs);
+      // Subscribe immediately; message delivery should not wait for an
+      // account-specific startup window.
+      subscribeGuilds(s, 0);
 
       // Science telemetry — real Discord clients POST app_opened after READY.
       // New accounts with zero telemetry history get higher scrutiny from Discord.
@@ -2083,13 +2005,9 @@ async function onDispatch(type: string, d: any, s: GatewaySession) {
 
     case "RESUMED": {
       // RESUME succeeded — session is live again without a full guild re-sync.
-      // Resumed sessions have existing session trust with Discord, so we skip
-      // the warm-up delay and telemetry burst that fresh IDENTIFYs use.
       pendingResumes.delete(s.accountId);
       retryCount.delete(s.accountId);
       s.isReady = true;
-      s.isResumed = true;
-      s.connectReadyAt = Date.now() - 300_000; // Mark as past warm-up window
       gatewayStatus.set(s.accountId, "ready");
       recomputeAccountRotations(s.accountId).catch(() => {});
       broadcastFn("gatewayStatus", {
@@ -2098,7 +2016,7 @@ async function onDispatch(type: string, d: any, s: GatewaySession) {
         status: "ready",
       });
       broadcastGatewayHealth();
-      logFn(`↩ RESUMED: ${s.accountName} — session restored cleanly (warm-up skipped)`);
+      logFn(`↩ RESUMED: ${s.accountName} — session restored cleanly`);
       // Re-subscribe all guilds after resume — Discord does NOT automatically
       // restore OP 14 lazy subscriptions, so MESSAGE_CREATE silently stops.
       subscribeGuilds(s, 0);
@@ -2156,17 +2074,6 @@ async function refreshAdminGuardSubscriptions() {
       }
     }
   }
-}
-
-// Check if any admin with the guard role is currently online in a guild
-function isAdminOnline(
-  s: GatewaySession,
-  guildId: string,
-  roleId: string,
-): boolean {
-  const key = `${guildId}:${roleId}`;
-  const onlineSet = s.adminOnlineMembers.get(key);
-  return (onlineSet?.size ?? 0) > 0;
 }
 
 async function onMessage(msg: any, s: GatewaySession) {
@@ -2312,14 +2219,6 @@ async function onMessage(msg: any, s: GatewaySession) {
     // Rotation/roster gate removed — rule config alone decides who may fire.
     // Per-message dedup below still guarantees one reply per message per rule.
 
-    // ── Admin Guard — skip if any admin with the watched role is online ─────
-    if (rule.adminGuardEnabled && rule.adminRoleId && guildId) {
-      if (isAdminOnline(s, guildId, rule.adminRoleId)) {
-        // Admin is watching — silently skip, do NOT fire
-        continue;
-      }
-    }
-
     // Keyword matching
     if (rule.triggerCondition === "keyword") {
       if (!rule.keyword) continue;
@@ -2359,16 +2258,8 @@ async function onMessage(msg: any, s: GatewaySession) {
           return;
         }
 
-        // Only requirement before sending: this account still has a live,
-        // ready gateway session (in this guild, when the message had one).
-        if (!(await isAccountReplyReady(s.accountId, guildId || undefined))) {
-          logFn(`SKIPPED [${ruleLabel}]: ${s.accountName} gateway is not ready before send`);
-          return;
-        }
-
-        // Claim only after all rule, roster, and admin gates pass, and only
-        // inside the serialized send callback. A second account/process cannot
-        // send the same message while this one is waiting on the delay.
+        // Claim inside the serialized send callback. A second account/process
+        // cannot send the same message while this one is waiting on the delay.
         const messageClaimed =
           msg.id ? await alreadyFired(msg.id, ruleId) : false;
         if (messageClaimed) {
@@ -2421,12 +2312,6 @@ async function onMessage(msg: any, s: GatewaySession) {
         const resolvedSrvNameForSend =
           srvInfo?.name || s.guildNames.get(guildId || "") || undefined;
 
-        // Skip channels that have repeatedly 403'd — saves API calls + TG spam
-        if (is403Blacklisted(s.accountId, channelId)) {
-          logFn(`🚫 SKIP BLACKLISTED [${ruleLabel}] ${s.accountName} in channel ${channelId}`);
-          return;
-        }
-
         const sendResult = await discordSend(
           channelId,
           s.token,
@@ -2444,18 +2329,6 @@ async function onMessage(msg: any, s: GatewaySession) {
           const guildName = guildId
             ? s.guildNames.get(guildId) || guildId
             : "Unknown";
-
-          // A REST 401 means the token is no longer usable even if the
-          // gateway has not delivered its fatal close yet. Release this
-          // account's roster ownership immediately so queued accounts can
-          // take over. A 403 is intentionally not treated the same way:
-          // it is normally a channel permission problem, not a dead token.
-          if (sendResult.status === 401) {
-            await storage.updateAccountStatus(s.accountId, "Disconnected").catch(() => {});
-            await recomputeAccountRotations(s.accountId).catch(() => {});
-          } else if (gatewayStatus.get(s.accountId) !== "ready") {
-            await recomputeAccountRotations(s.accountId).catch(() => {});
-          }
 
           // Track 403s — blacklist after 3 consecutive failures on same channel
           if (sendResult.status === 403) {
@@ -2681,43 +2554,18 @@ async function discordSend(
   const fp = accountId ? getFingerprint(accountId) : null;
   const reqHeaders = fp ? makeHeaders(fp) : HEADERS;
 
-  // ── Warm-up guard — new-account quiet period ──────────────────────────────
-  // Fresh sessions (non-RESUME) have no prior trust history with Discord.
-  // Sending messages within the first 90–150 s is the #1 ML detection signal.
-  // We hold the reply until the quiet window has passed, then proceed normally.
-  // Resumed sessions set connectReadyAt 5 min in the past, bypassing this.
-  if (accountId) {
-    const sess = sessions.get(accountId);
-    if (sess && sess.connectReadyAt > 0) {
-      const WARMUP_MS = 90_000 + hashStr(accountId + "warmup") % 60_000; // 90–150 s
-      const elapsed = Date.now() - sess.connectReadyAt;
-      if (elapsed < WARMUP_MS) {
-        const remaining = WARMUP_MS - elapsed;
-        logFn(`⏳ WARM-UP HOLD [${accountId.slice(-6)}]: waiting ${Math.round(remaining / 1000)}s before reply`);
-        await new Promise(r => setTimeout(r, remaining));
-      }
-    }
-  }
-
-  // ── Behavioral pacing: simulate reading + typing before every send ─────────
-  // Real humans take time to read a message before replying. The combined
-  // reading-pause + typing indicator is the single most effective anti-ban
-  // measure — it makes the HTTP traffic pattern indistinguishable from a person.
+  // ── Typing pacing before every send ────────────────────────────────────────
+  // The configured rule delay is applied by enqueueChannelSend. The typing
+  // duration below is the only additional message delay.
   try {
-    // Reading pause: 0.3–0.8 s. Kept short so total pre-send pacing (read +
-    // typing) stays around ~2 s while still looking human. rule.delayMs is
-    // applied separately and is the user-configurable per-rule delay.
-    const readMs = 300 + Math.random() * 500;
-    await new Promise((r) => setTimeout(r, readMs));
-
     // Send typing indicator — tells Discord "a human is composing"
     await fetch(`${DISCORD_API}/channels/${channelId}/typing`, {
       method: "POST",
       headers: { ...reqHeaders, Authorization: token },
     });
 
-    // Typing duration: scales with reply length but capped at ~1.2 s so the
-    // whole read+typing window lands near 2 s max.
+    // Typing duration scales with reply length and remains the only pacing
+    // delay inside the send operation.
     const replyText = rule.message || "";
     const wordCount = Math.max(1, replyText.split(/\s+/).length);
     const typingMs = Math.min(
@@ -2949,12 +2797,6 @@ export async function sendTestMessage(
       success: false,
       message: "Account not found — check the profile linked to this rule",
     };
-  if (account.status !== "Connected")
-    return {
-      success: false,
-      message: `Account "${account.name}" is disconnected`,
-    };
-
   const target = channels[0];
   // User tokens cannot send embeds — always use content
   const testFp = getFingerprint(account.id);
@@ -3055,7 +2897,7 @@ async function gatewayWatchdog() {
   try {
     if (!isFleetActive()) return;
     const accounts = await storage.getAccounts();
-    const connected = accounts.filter((a) => a.status === "Connected");
+    const connected = accounts.filter((a) => !!a.token);
     const orphans: typeof connected = [];
     for (const acc of connected) {
       const st = gatewayStatus.get(acc.id);
