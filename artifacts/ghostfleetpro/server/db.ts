@@ -63,7 +63,6 @@ async function migrateLegacyGuildDocuments(db: Db): Promise<void> {
       guilds: { $elemMatch: { $or: [
         { features: { $exists: true } },
         { permissions: { $exists: true } },
-        { icon: { $exists: true } },
         { banner: { $exists: true } },
       ] } },
     },
@@ -72,7 +71,7 @@ async function migrateLegacyGuildDocuments(db: Db): Promise<void> {
   let migrated = 0;
   for await (const doc of cursor) {
     const guilds = Array.isArray(doc.guilds)
-      ? doc.guilds.map((guild: any) => ({ id: guild.id, name: guild.name }))
+      ? doc.guilds.map((guild: any) => ({ id: guild.id, name: guild.name, icon: guild.icon ?? null }))
       : [];
     await db.collection("accounts").updateOne(
       { _id: doc._id },
