@@ -607,9 +607,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       logToConsole(`RULE CREATED: "${rule.label}" (ID: ${rule.id})`, wsId);
       broadcast("ruleCreated", rule);
       res.status(201).json(rule);
-      // Fire-and-forget: sync the global roster so any newly-checked servers
-      // get a joinedAt timestamp = right now, and rotation recomputes
-      syncRosterFromRules().catch((e) => logToConsole(`ROSTER SYNC ERR: ${e.message}`));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -634,9 +631,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       bustCache("rules:");
       logToConsole(`RULE UPDATED: ID ${id} "${updated.label}"`);
       res.json(updated);
-      // Fire-and-forget: any newly checked server gets joinedAt = right now,
-      // any unchecked server rolls its roster entry to "left" + rotates
-      syncRosterFromRules().catch((e) => logToConsole(`ROSTER SYNC ERR: ${e.message}`));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -650,7 +644,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     bustCache("rules:");
     logToConsole(`RULE DELETED: ID ${id}`, wsId);
     res.status(204).send();
-    syncRosterFromRules().catch((e) => logToConsole(`ROSTER SYNC ERR: ${e.message}`));
   });
 
   // === HISTORY ===
@@ -897,7 +890,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const { guildId, accountId } = req.query as { guildId?: string; accountId?: string };
       if (guildId) {
-        await recomputeRotation(guildId);
         const refreshedQueue = await storage.getServerQueue(guildId);
         const health = await getRosterHealthSnapshot(refreshedQueue);
         return res.json(refreshedQueue.map((entry: any) => ({
@@ -960,9 +952,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
        // Recomputing can perform Discord token checks with a 5s timeout per
        // account. Do it in the background so a slow/disconnected gateway never
        // makes the admin roster appear empty or hang indefinitely.
-       void Promise.all(guildIds.map((id) => recomputeRotation(id))).catch((e: any) => {
-         logToConsole(`ROSTER VIEW REFRESH ERR: ${e.message}`);
-       });
       const rosterDocs = guildIds.length > 0
         ? await db.collection("server_roster").find({ guildId: { $in: guildIds } }).sort({ joinedAt: 1 }).toArray()
         : [];
@@ -1086,12 +1075,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         checked++;
         const guilds: any[] = doc.guilds ?? [];
         if (!Array.isArray(guilds) || guilds.length === 0) { skipped++; continue; }
-        const needsSlim = guilds.some((g) => Object.keys(g).some((k) => k !== "id" && k !== "name"));
+        const needsSlim = guilds.some((g) => Object.keys(g).some((k) => k !== "id" && k !== "name" && k !== "icon"));
         if (!needsSlim) { skipped++; continue; }
         bulkOps.push({
           updateOne: {
             filter: { _id: doc._id },
-            update: { $set: { guilds: guilds.map((g: any) => ({ id: g.id, name: g.name })) } },
+            update: { $set: { guilds: guilds.map((g: any) => ({ id: g.id, name: g.name, icon: g.icon ?? null })) } },
           },
         });
         updated++;
