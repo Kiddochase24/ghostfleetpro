@@ -150,7 +150,7 @@ export class MongoStorage implements IStorage {
     const projection = {
       id: 1, workspaceId: 1, name: 1, token: 1, status: 1, avatar: 1,
       username: 1, discriminator: 1, lastSeen: 1,
-      "guilds.id": 1, "guilds.name": 1,
+      "guilds.id": 1, "guilds.name": 1, "guilds.icon": 1,
     };
     const docs = await db.collection("accounts").find(filter, { projection }).sort({ lastSeen: -1 }).toArray();
     return docs.map(d => clean<Account>(d));
@@ -162,7 +162,7 @@ export class MongoStorage implements IStorage {
       projection: {
         id: 1, workspaceId: 1, name: 1, token: 1, status: 1, avatar: 1,
         username: 1, discriminator: 1, lastSeen: 1,
-        "guilds.id": 1, "guilds.name": 1,
+        "guilds.id": 1, "guilds.name": 1, "guilds.icon": 1,
       },
     });
     return doc ? clean<Account>(doc) : undefined;
@@ -209,7 +209,7 @@ export class MongoStorage implements IStorage {
     // Only persist id + name. Full Discord guild objects include huge features[]
     // arrays and permissions strings that are never read back at runtime.
     // Keeping the full objects was the primary cause of heap OOM on the VPS.
-    const slim = guilds.map((g) => ({ id: g.id, name: g.name }));
+    const slim = guilds.map((g: any) => ({ id: g.id, name: g.name, icon: g.icon ?? null }));
     await db.collection("accounts").updateOne({ id }, { $set: { guilds: slim } });
   }
 
