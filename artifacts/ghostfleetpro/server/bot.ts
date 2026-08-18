@@ -267,8 +267,7 @@ interface GatewaySession {
 async function runStoragePurge() {
   try {
     const histDeleted = await storage.deleteOldHistory(24 * 60 * 60 * 1000);
-    const rosterDeleted = await storage.purgeOrphanedRosterEntries();
-    logFn(`PURGE: removed ${histDeleted} old history entries, ${rosterDeleted} orphaned roster entries`);
+    logFn(`PURGE: removed ${histDeleted} old history entries`);
   } catch (e: any) {
     logFn(`PURGE ERR: ${e.message}`);
   }
@@ -722,45 +721,10 @@ let logFn: (msg: string, wsId?: number) => void = () => {};
 // via rule config", exactly as configured across the whole GhostFleet, ignoring
 // which workspace the rule/account belongs to.
 
-// ── Roster status cache — avoids a DB hit on every incoming message ───────
-// Key: `${accountId}:${guildId}`, value: roster status + timestamp.
-// TTL: 10 s — short enough that rotation changes (recomputeRotation busts the
-// cache instantly) propagate within one message cycle even without a bust.
-const rosterStatusCache = new Map<string, { status: string; ts: number }>();
-const ROSTER_CACHE_TTL_MS = 10_000;
-// Throttle map for rotation-queue log lines (once per account+guild per 60 s)
-const rotationBlockLog = new Map<string, number>();
-
-async function getRosterStatus(
-  accountId: string,
-  guildId: string,
-): Promise<string> {
-  const key = `${accountId}:${guildId}`;
-  const now = Date.now();
-  const cached = rosterStatusCache.get(key);
-  if (cached && now - cached.ts < ROSTER_CACHE_TTL_MS) return cached.status;
-  try {
-    const db = await getDb();
-    const row = await db
-      .collection("server_roster")
-      .findOne({ accountId, guildId }, { projection: { status: 1 } });
-    // No roster entry means this account hasn't been synced yet — treat as
-    // queued so it never fires alongside the actual active account.
-    const status: string = row?.status ?? "queued";
-    rosterStatusCache.set(key, { status, ts: now });
-    return status;
-  } catch {
-    // DB error — fail closed: block rather than risk a double-send.
-    return "error";
-  }
-}
-
-function invalidateRosterCache(guildId: string): void {
-  const suffix = `:${guildId}`;
-  for (const k of rosterStatusCache.keys()) {
-    if (k.endsWith(suffix)) rosterStatusCache.delete(k);
-  }
-}
+// ── Roster gating REMOVED ─────────────────────────────────────────────────
+// Ghost Fleet no longer consults `server_roster` at runtime. Reply eligibility
+// is decided purely by rule config + a live, ready gateway session. No DB read
+// and no queued/active decision sits on the message hot path any more.
 
 // An account is only allowed to own a roster slot or send a reply when both
 // persistence and the live gateway agree that it is usable.  Checking the
@@ -788,20 +752,9 @@ async function isAccountReplyReady(
   }
 }
 
-async function recomputeAccountRotations(accountId: string): Promise<void> {
-  try {
-    const roster = await storage.getRosterByAccount(accountId);
-    const guildIds = new Set(
-      roster
-        .filter((entry) => entry.status === "active" || entry.status === "queued")
-        .map((entry) => entry.guildId),
-    );
-    for (const guildId of guildIds) {
-      await recomputeRotation(guildId);
-    }
-  } catch (e: any) {
-    logFn(`ROSTER ROTATION ERR [${accountId}]: ${e.message}`);
-  }
+// Roster rotation is disabled — kept as a no-op so existing call sites stay valid.
+async function recomputeAccountRotations(_accountId: string): Promise<void> {
+  return;
 }
 
 export type RosterHealth = {
@@ -938,58 +891,9 @@ export async function getRosterHealthSnapshot(
 // A persisted roster row can outlive its account session, token, or server
 // membership. Keep that row visible for diagnosis, but stamp it as stale and
 // force it out of the active slot so it cannot block a healthy replacement.
-export async function recomputeRotation(guildId: string): Promise<void> {
-  // Bust the per-account cache for this guild so the next message sees the new status
-  invalidateRosterCache(guildId);
-
-  const db = await getDb();
-  const eligible = await db.collection("server_roster")
-    .find({ guildId, status: { $in: ["active", "queued"] } })
-    .sort({ joinedAt: 1 })
-    .toArray();
-  if (eligible.length === 0) return;
-
-  const accounts = await storage.getAccounts();
-  const accountStatus = new Map(accounts.map((account) => [account.id, account]));
-  const health = await Promise.all(
-    eligible.map(async (row) => ({ row, health: await getRosterHealth(row, accountStatus) })),
-  );
-  const healthy = health.filter(({ health: state }) => state.healthy).map(({ row }) => row);
-  const preferred = healthy.find((row) => row.primaryRequested === true);
-  const primary = preferred ?? healthy[0];
-  const ops: Promise<any>[] = [];
-  for (const { row, health: state } of health) {
-    const desiredStatus =
-      primary && row._id?.toString() === primary._id?.toString()
-        ? "active"
-        : "queued";
-    const staleUpdate = state.stale
-      ? { stale: true, staleReason: state.reason, staleAt: row.staleAt ?? new Date() }
-      : { stale: false, staleReason: null, staleAt: null };
-    if (
-      row.status !== desiredStatus ||
-      row.stale !== staleUpdate.stale ||
-      row.staleReason !== staleUpdate.staleReason
-    ) {
-      ops.push(
-        db.collection("server_roster").updateOne(
-          { _id: row._id },
-          { $set: { status: desiredStatus, ...staleUpdate } },
-        ),
-      );
-    }
-  }
-  if (ops.length > 0) await Promise.all(ops);
-
-  if (!primary) return;
-
-  broadcastFn("rosterRotation", {
-    guildId,
-    guildName: primary.guildName,
-    activeAccountId: primary.accountId,
-    activeAccountName: primary.accountName,
-    queueSize: healthy.length,
-  });
+export async function recomputeRotation(_guildId: string): Promise<void> {
+  // Rotation engine disabled: no roster ownership, no promotion/demotion work.
+  return;
 }
 
 // Admin-selected promotion. The preference is persisted, but health checks still
@@ -1030,16 +934,8 @@ export async function clearPrimaryAccount(guildId: string): Promise<void> {
 }
 
 async function verifyRosterHealth(): Promise<void> {
-  try {
-    const db = await getDb();
-    const rows = await db.collection("server_roster")
-      .find({ status: { $in: ["active", "queued"] } })
-      .toArray();
-    const guildIds = new Set(rows.map((row) => row.guildId));
-    for (const guildId of guildIds) await recomputeRotation(guildId);
-  } catch (e: any) {
-    logFn(`ROSTER HEALTH ERR: ${e.message}`);
-  }
+  // Roster health polling disabled.
+  return;
 }
 
 // Reads every ACTIVE rule across ALL workspaces, resolves the (accountId, guildId)
@@ -1051,86 +947,8 @@ async function verifyRosterHealth(): Promise<void> {
 // This is the ONLY place new roster rows get created — Discord gateway events no
 // longer create rows, they only update metadata on rows that already exist here.
 export async function syncRosterFromRules(): Promise<void> {
-  const db = await getDb();
-  const [rules, accounts] = await Promise.all([
-    db.collection("rules").find({ isActive: true }).toArray(),
-    storage.getAccounts(),
-  ]);
-  const accountMap = new Map(accounts.map((a) => [a.id, a]));
-
-  const validPairs = new Map<string, { accountId: string; guildId: string; guildName: string }>();
-  for (const rule of rules) {
-    if (rule.profileId === "all") {
-      const cfgs = rule.profileConfigs || {};
-      for (const [accountId, cfg] of Object.entries(cfgs) as [string, any][]) {
-        for (const srv of cfg?.selectedServers || []) {
-          if (srv?.id) validPairs.set(`${accountId}:${srv.id}`, { accountId, guildId: srv.id, guildName: srv.name || srv.id });
-        }
-      }
-    } else {
-      const accountId = rule.profileId;
-      for (const srv of rule.selectedServers || []) {
-        if (srv?.id) validPairs.set(`${accountId}:${srv.id}`, { accountId, guildId: srv.id, guildName: srv.name || srv.id });
-      }
-    }
-  }
-
-  const touchedGuilds = new Set<string>();
-
-  for (const pair of validPairs.values()) {
-    const acc = accountMap.get(pair.accountId);
-    if (!acc) continue;
-    const existing = await db.collection("server_roster").findOne({ guildId: pair.guildId, accountId: pair.accountId });
-    if (!existing) {
-      await db.collection("server_roster").insertOne({
-        guildId: pair.guildId,
-        guildName: pair.guildName,
-        accountId: pair.accountId,
-        accountName: acc.name,
-        workspaceId: acc.workspaceId ?? null,
-        joinedAt: new Date(),
-        lastSeen: new Date(),
-        status: "queued",
-      });
-      touchedGuilds.add(pair.guildId);
-    } else if (existing.status === "left") {
-      // Re-added to a rule after being dropped — treat as a fresh queue entry now
-      await db.collection("server_roster").updateOne(
-        { _id: existing._id },
-        { $set: {
-          status: "queued",
-          joinedAt: new Date(),
-          lastSeen: new Date(),
-          guildName: pair.guildName,
-          accountName: acc.name,
-          workspaceId: acc.workspaceId ?? null,
-        } },
-      );
-      touchedGuilds.add(pair.guildId);
-    } else if (existing.guildName !== pair.guildName || existing.accountName !== acc.name) {
-      await db.collection("server_roster").updateOne(
-        { _id: existing._id },
-        { $set: { guildName: pair.guildName, accountName: acc.name } },
-      );
-    }
-  }
-
-  const activeOrQueued = await db.collection("server_roster")
-    .find({ status: { $in: ["active", "queued"] } })
-    .toArray();
-  for (const entry of activeOrQueued) {
-    if (!validPairs.has(`${entry.accountId}:${entry.guildId}`)) {
-      await db.collection("server_roster").updateOne({ _id: entry._id }, { $set: { status: "left", lastSeen: new Date() } });
-    }
-    // Recompute EVERY guild with an eligible row on every sync, not just newly
-    // touched ones — cheap and idempotent, and guarantees single-active-occupancy
-    // even for legacy rows that predate this rotation engine.
-    touchedGuilds.add(entry.guildId);
-  }
-
-  for (const guildId of touchedGuilds) {
-    await recomputeRotation(guildId);
-  }
+  // Roster sync disabled — rules alone decide which accounts reply.
+  return;
 }
 
 // Auto-refresh every connected account's Discord guild list on an interval so new
@@ -1141,9 +959,7 @@ function startAccountAutoRefresh() {
   setInterval(async () => {
     try {
       const accounts = await storage.getAccounts();
-      const db = await getDb();
       let refreshed = 0;
-      let departures = 0;
       for (const acc of accounts) {
         if (acc.status !== "Connected" || !acc.token) continue;
         try {
@@ -1153,34 +969,13 @@ function startAccountAutoRefresh() {
           });
           if (!guildsRes.ok) continue;
           const guilds = (await guildsRes.json()) as any[];
-          const newIds = new Set(guilds.map((g: any) => g.id));
-          const oldIds = new Set((acc.guilds || []).map((g: any) => g.id));
-          const leftGuildIds = [...oldIds].filter((id) => !newIds.has(id));
-
           await storage.updateAccountGuilds(acc.id, guilds);
           refreshed++;
-
-          for (const guildId of leftGuildIds) {
-            const entry = await db.collection("server_roster").findOne({
-              guildId, accountId: acc.id, status: { $in: ["active", "queued"] },
-            });
-            if (entry) {
-              await db.collection("server_roster").updateOne(
-                { _id: entry._id },
-                { $set: { status: "left", lastSeen: new Date() } },
-              );
-              departures++;
-              await recomputeRotation(guildId);
-              logFn(`ROSTER: ${acc.name} auto-detected as no longer in "${entry.guildName}" — rotating queue`);
-            }
-          }
         } catch { /* skip this account, try next */ }
         await new Promise((r) => setTimeout(r, 250)); // stagger to avoid Discord rate limits
       }
-      // Safety-net: catch any rule-server pairs not yet reflected in the roster
-      await syncRosterFromRules();
       if (refreshed > 0) {
-        logFn(`AUTO-REFRESH: synced guild lists for ${refreshed} account(s)${departures > 0 ? `, ${departures} departure(s) detected` : ""}`);
+        logFn(`AUTO-REFRESH: synced guild lists for ${refreshed} account(s)`);
       }
     } catch (e: any) {
       logFn(`AUTO-REFRESH ERR: ${e.message}`);
@@ -1262,23 +1057,12 @@ export function initBotEngine(
     }
     syncSessions();
 
-    // ── Roster sync — timestamp is rule-activation time, rotation is global ──
-    // Populates/repairs the roster strictly from active rules' server configs,
-    // and starts the recurring account guild auto-refresh (10 min).
-    try {
-      await syncRosterFromRules();
-      logFn("ROSTER: synced from active rules across all workspaces");
-    } catch (e: any) {
-      logFn(`ROSTER SYNC ERR: ${e.message}`);
-    }
+    // Roster sync removed from startup — nothing blocks the first session pass.
     startAccountAutoRefresh();
   });
 
   // Sync sessions every 15s — opens/closes sessions to match DB
   setInterval(syncSessions, 15000);
-  // Re-evaluate every roster slot on a short cadence. This repairs persisted
-  // active rows when a token, gateway, or server membership becomes stale.
-  setInterval(verifyRosterHealth, 30_000);
   // Watchdog every 30s — recovers orphaned dead sessions + broadcasts health
   setInterval(gatewayWatchdog, 30000);
   // Periodic OP 14 renewal every 10 minutes — keeps MESSAGE_CREATE flowing.
@@ -2525,31 +2309,8 @@ async function onMessage(msg: any, s: GatewaySession) {
     }
     if (!shouldFire) continue;
 
-    // ── Rotation gate — only the single "active" account per guild fires ──────
-    // Strict: ONLY an explicit "active" roster status passes. Every other status
-    // ("queued", "left", "kicked", "banned", "error", or no entry at all) is
-    // blocked. This guarantees at most one account fires per guild per message,
-    // regardless of how many accounts are configured for the same server.
-    if (guildId) {
-      const rStatus = await getRosterStatus(s.accountId, guildId);
-      if (rStatus !== "active") {
-        // Always log so the user can see why replies aren't firing.
-        // "queued" is the most common state (waiting for rotation to promote),
-        // so we log it at a lower rate to avoid spamming the console.
-        if (rStatus === "queued") {
-          // Rate-limit: log at most once per account+guild per 60s
-          const throttleKey = `rotlog:${s.accountId}:${guildId}`;
-          const lastLog = (rotationBlockLog.get(throttleKey) ?? 0);
-          if (Date.now() - lastLog > 60_000) {
-            rotationBlockLog.set(throttleKey, Date.now());
-            logFn(`ROTATION QUEUE [${rule.label}]: ${s.accountName} is queued (not yet active) in guild ${guildId} — run /api/admin/roster-sync to promote`);
-          }
-        } else {
-          logFn(`ROTATION BLOCK [${rule.label}]: ${s.accountName} status="${rStatus}" in guild ${guildId} — skipping`);
-        }
-        continue;
-      }
-    }
+    // Rotation/roster gate removed — rule config alone decides who may fire.
+    // Per-message dedup below still guarantees one reply per message per rule.
 
     // ── Admin Guard — skip if any admin with the watched role is online ─────
     if (rule.adminGuardEnabled && rule.adminRoleId && guildId) {
@@ -2598,20 +2359,9 @@ async function onMessage(msg: any, s: GatewaySession) {
           return;
         }
 
-        // The active account or its gateway may have changed while this reply
-        // was waiting in the channel queue. Recompute before sending so a
-        // stale active row cannot silence the healthy queued account.
-        if (guildId) {
-          const rosterStatus = await getRosterStatus(s.accountId, guildId);
-          const ready = await isAccountReplyReady(s.accountId, guildId);
-          if (rosterStatus !== "active" || !ready) {
-            await recomputeRotation(guildId).catch(() => {});
-            logFn(
-              `SKIPPED [${ruleLabel}]: ${s.accountName} lost active/ready roster ownership before send`,
-            );
-            return;
-          }
-        } else if (!(await isAccountReplyReady(s.accountId))) {
+        // Only requirement before sending: this account still has a live,
+        // ready gateway session (in this guild, when the message had one).
+        if (!(await isAccountReplyReady(s.accountId, guildId || undefined))) {
           logFn(`SKIPPED [${ruleLabel}]: ${s.accountName} gateway is not ready before send`);
           return;
         }
