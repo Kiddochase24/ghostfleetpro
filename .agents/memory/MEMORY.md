@@ -11,3 +11,4 @@
 - [Classifier confidence + timeouts](classifier-and-timeouts.md) — don't divide confidence by keyword-list length; OpenAI classify + client apiRequest need hard timeouts; purge runs at boot.
 - [VPS deployment](vps-deployment.md) — prod runs on self-managed VPS via pm2 (nvm shell, push over SSH); not Replit Deployments.
 - [App WebSocket and Mongo deployment](app-websocket-and-mongo-deployment.md) — accept root and artifact WS paths; migrate and project legacy guild data at startup.
+- [Proxy-Cheap session routing](proxy-cheap-session-routing.md) — per-account sticky HTTP/WebSocket agents use username-session-accN; bootstrap token lookups use a shared session until the account ID exists.

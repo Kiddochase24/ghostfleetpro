@@ -3,6 +3,7 @@ import type { Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { initBotEngine, sendTestMessage, getGatewayStatus, refreshSessions, invalidateRulesCache, getDevFleetEnabled, setDevFleetEnabled, syncRosterFromRules, setPrimaryAccount, clearPrimaryAccount, recomputeRotation, getRosterHealthSnapshot } from "./bot";
+import { applyProxySettings, proxyFetch, validateProxySettings } from "./proxy";
 import { z } from "zod";
 import os from "os";
 import crypto from "crypto";
@@ -101,7 +102,7 @@ async function discordFetch(path: string, token: string, accountId?: string) {
         "Origin": "https://discord.com",
         "Referer": "https://discord.com/channels/@me",
       };
-  const res = await fetch(`${DISCORD_API}${path}`, { headers });
+  const res = await proxyFetch(`${DISCORD_API}${path}`, { headers }, accountId);
   return { res, latency: Date.now() - start };
 }
 
@@ -463,7 +464,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const start = Date.now();
       // Use a temporary fingerprint keyed on the token itself (account ID not known yet)
       const tempHeaders = accountHeaders(crypto.createHash("md5").update(token).digest("hex"), token);
-      const meRes = await fetch(`${DISCORD_API}/users/@me`, { headers: tempHeaders });
+      // The account ID is not known until this request succeeds, so use the
+      // shared bootstrap session. Subsequent account traffic uses the real ID.
+      const meRes = await proxyFetch(`${DISCORD_API}/users/@me`, { headers: tempHeaders });
       const latency = Date.now() - start;
 
       if (!meRes.ok) {
@@ -478,9 +481,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       let guilds: any[] = [];
       try {
         // Now we have the real account ID — use proper per-account fingerprint
-        const guildsRes = await fetch(`${DISCORD_API}/users/@me/guilds`, {
+        const guildsRes = await proxyFetch(`${DISCORD_API}/users/@me/guilds`, {
           headers: accountHeaders(user.id, token),
-        });
+        }, user.id);
         if (guildsRes.ok) guilds = await guildsRes.json();
       } catch {}
 
@@ -660,9 +663,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.post("/api/config", async (req, res) => {
     try {
+      const proxyError = validateProxySettings(req.body || {});
+      if (proxyError) return res.status(400).json({ error: proxyError });
       const entries = Object.entries(req.body) as [string, string][];
       for (const [key, value] of entries) {
         if (typeof value === "string") await storage.setConfig(key, value);
+      }
+      applyProxySettings(req.body || {});
+      if (Object.keys(req.body || {}).some((key) => key.startsWith("proxy_cheap_"))) {
+        refreshSessions();
       }
       res.json({ success: true });
     } catch (err: any) {
@@ -689,7 +698,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         crypto.createHash("md5").update(token).digest("hex"),
         token,
       );
-      const meRes = await fetch(`${DISCORD_API}/users/@me`, { headers: verifyHeaders });
+      const meRes = await proxyFetch(`${DISCORD_API}/users/@me`, {
+        headers: verifyHeaders,
+      });
       const latency = Date.now() - start;
       if (!meRes.ok) return res.json({ valid: false, latency });
       const user = await meRes.json() as any;

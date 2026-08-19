@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import OpenAI from "openai";
 import { storage } from "./storage";
 import { getDb } from "./db";
-import { getWsAgent } from "./proxy";
+import { getWsAgent, proxyFetch } from "./proxy";
 
 // OpenAI client — lazy singleton so that adding OPENAI_API_KEY after startup
 // is picked up on the next classify call without a server restart.
@@ -748,10 +748,10 @@ async function checkAccountToken(account: any): Promise<boolean | null> {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), TOKEN_HEALTH_TIMEOUT_MS);
       try {
-        const response = await fetch(`${DISCORD_API}/users/@me`, {
+        const response = await proxyFetch(`${DISCORD_API}/users/@me`, {
           headers: { ...makeHeaders(getFingerprint(account.id)), Authorization: account.token },
           signal: controller.signal,
-        });
+        }, account.id);
         if (response.ok) {
           tokenHealth.set(account.id, { valid: true, checkedAt: Date.now(), token: account.token });
           return true;
@@ -920,9 +920,9 @@ function startAccountAutoRefresh() {
         if (!acc.token) continue;
         try {
           const accFp = getFingerprint(acc.id);
-          const guildsRes = await fetch(`${DISCORD_API}/users/@me/guilds`, {
+          const guildsRes = await proxyFetch(`${DISCORD_API}/users/@me/guilds`, {
             headers: { ...makeHeaders(accFp), Authorization: acc.token },
-          });
+          }, acc.id);
           if (!guildsRes.ok) continue;
           const guilds = (await guildsRes.json()) as any[];
           await storage.updateAccountGuilds(acc.id, guilds);
@@ -1693,7 +1693,7 @@ async function onDispatch(type: string, d: any, s: GatewaySession) {
           const fp = s.fingerprint;
           const scienceDelay = 8000 + Math.random() * 12000; // 8–20 s after READY
           await new Promise(r => setTimeout(r, scienceDelay));
-          await fetch(`${DISCORD_API}/science`, {
+          await proxyFetch(`${DISCORD_API}/science`, {
             method: "POST",
             headers: {
               ...makeHeaders(fp),
@@ -1710,7 +1710,7 @@ async function onDispatch(type: string, d: any, s: GatewaySession) {
                 }
               }]
             }),
-          });
+          }, s.accountId);
         } catch { /* non-fatal — Discord may 404 science for new accounts */ }
       }, 0);
 
@@ -2404,12 +2404,13 @@ async function onMessage(msg: any, s: GatewaySession) {
         if (deleteDelayMs > 0 && sentMsgId) {
           setTimeout(async () => {
             try {
-              await fetch(
+              await proxyFetch(
                 `${DISCORD_API}/channels/${channelId}/messages/${sentMsgId}`,
                 {
                   method: "DELETE",
                   headers: { ...makeHeaders(s.fingerprint), Authorization: s.token },
                 },
+                s.accountId,
               );
               logFn(
                 `🗑 AUTO-DELETE [${ruleLabel}] msg ${sentMsgId} after ${deleteDelayMs}ms`,
@@ -2559,10 +2560,10 @@ async function discordSend(
   // duration below is the only additional message delay.
   try {
     // Send typing indicator — tells Discord "a human is composing"
-    await fetch(`${DISCORD_API}/channels/${channelId}/typing`, {
+    await proxyFetch(`${DISCORD_API}/channels/${channelId}/typing`, {
       method: "POST",
       headers: { ...reqHeaders, Authorization: token },
-    });
+    }, accountId);
 
     // Typing duration scales with reply length and remains the only pacing
     // delay inside the send operation.
@@ -2621,7 +2622,7 @@ async function discordSend(
 
       // Create a thread from the triggering message
       const threadResp = await Promise.race([
-        fetch(
+        proxyFetch(
           `${DISCORD_API}/channels/${channelId}/messages/${replyToId}/threads`,
           {
             method: "POST",
@@ -2636,6 +2637,7 @@ async function discordSend(
               rate_limit_per_user: 0,
             }),
           },
+          accountId,
         ),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error("THREAD_TIMEOUT")), 10000),
@@ -2647,7 +2649,7 @@ async function discordSend(
         const threadId: string = threadData.id;
 
         return Promise.race([
-          fetch(`${DISCORD_API}/channels/${threadId}/messages`, {
+          proxyFetch(`${DISCORD_API}/channels/${threadId}/messages`, {
             method: "POST",
             headers: {
               ...reqHeaders,
@@ -2655,7 +2657,7 @@ async function discordSend(
               "Content-Type": "application/json",
             },
             body: JSON.stringify({ content, nonce: discordNonce() }),
-          }),
+          }, accountId),
           new Promise((_, reject) =>
             setTimeout(() => reject(new Error("THREAD_SEND_TIMEOUT")), 10000),
           ),
@@ -2681,7 +2683,7 @@ async function discordSend(
     nonce: discordNonce(),
   };
 
-  return fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
+  return proxyFetch(`${DISCORD_API}/channels/${channelId}/messages`, {
     method: "POST",
     headers: {
       ...reqHeaders,
@@ -2689,7 +2691,7 @@ async function discordSend(
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
-  });
+  }, accountId);
 }
 
 // Resolve a channel name — session cache → in-flight dedup → Discord REST API
@@ -2705,9 +2707,9 @@ async function resolveChannelName(
   if (inflight) return inflight;
   const promise = (async () => {
     try {
-      const resp = await fetch(`${DISCORD_API}/channels/${channelId}`, {
+      const resp = await proxyFetch(`${DISCORD_API}/channels/${channelId}`, {
         headers: { ...makeHeaders(s.fingerprint), Authorization: s.token },
-      });
+      }, s.accountId);
       if (resp.ok) {
         const ch = await resp.json();
         if (ch.name) {
@@ -2805,7 +2807,7 @@ export async function sendTestMessage(
     nonce: discordNonce(),
   };
 
-  const res = await fetch(`${DISCORD_API}/channels/${target.id}/messages`, {
+  const res = await proxyFetch(`${DISCORD_API}/channels/${target.id}/messages`, {
     method: "POST",
     headers: {
       ...makeHeaders(testFp),
@@ -2813,7 +2815,7 @@ export async function sendTestMessage(
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
-  });
+  }, account.id);
 
   if (res.ok) {
     logFn(

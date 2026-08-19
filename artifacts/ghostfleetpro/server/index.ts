@@ -5,9 +5,9 @@ import { createServer } from "http";
 import { EventEmitter } from "events";
 import { setupGlobalFetchProxy } from "./proxy";
 
-// ── SOCKS5 proxy: must run before any outbound fetch/WebSocket calls ──────────
-// Routes all Discord HTTP API traffic through the configured proxy.
-// Set PROXY_HOST + PROXY_PORT in .env to activate; no-op when absent.
+// ── Proxy-Cheap setup: load persisted/env settings before bot sessions open ──
+// Discord HTTP calls use account-specific https-proxy-agent instances and
+// gateway WebSockets use the matching agent.
 await setupGlobalFetchProxy();
 
 // Raise the global listener limit — 100 WebSocket sessions × multiple emitters

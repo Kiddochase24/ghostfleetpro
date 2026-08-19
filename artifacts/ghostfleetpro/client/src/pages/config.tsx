@@ -5,7 +5,7 @@ import { useToast } from "@/hooks/use-toast";
 import {
   Save, Loader2, Shield, Bell, Globe, Zap, Info, KeyRound,
   Trash2, Copy, CheckCircle2, RefreshCw, ExternalLink,
-  Download, Upload
+  Download, Upload, Network
 } from "lucide-react";
 import { apiRequest, appUrl, getWorkspaceId } from "@/lib/queryClient";
 import { motion, AnimatePresence } from "framer-motion";
@@ -30,6 +30,18 @@ const CONFIG_SECTIONS = [
       { key: "global_delay_ms", label: "Global Delay Fallback (ms)", placeholder: "0", type: "number" },
       { key: "max_messages_per_hour", label: "Max Messages / Hour", placeholder: "100", type: "number" },
       { key: "anti_detection", label: "Anti-Detection Mode", placeholder: "true", type: "select", options: ["true", "false"] },
+    ]
+  },
+  {
+    id: "proxy",
+    label: "Proxy-Cheap",
+    icon: Network,
+    keys: [
+      { key: "proxy_cheap_host", label: "Proxy Host", placeholder: "proxy.example.com", type: "text" },
+      { key: "proxy_cheap_port", label: "Proxy Port", placeholder: "10000", type: "number" },
+      { key: "proxy_cheap_username", label: "Proxy Username", placeholder: "username", type: "text" },
+      { key: "proxy_cheap_password", label: "Proxy Password", placeholder: "password", type: "password" },
+      { key: "proxy_cheap_account_count", label: "Total Account Count (1–50)", placeholder: "10", type: "number" },
     ]
   },
   {

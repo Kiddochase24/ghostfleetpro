@@ -75,5 +75,9 @@
     "vite": "catalog:",
     "wouter": "^3.3.5",
     "zod": "catalog:"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^9.1.0",
+    "node-fetch": "^3.3.2"
   }
 }

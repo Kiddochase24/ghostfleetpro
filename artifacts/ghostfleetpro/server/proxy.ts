@@ -1,185 +1,196 @@
 /**
- * server/proxy.ts
+ * Per-account Proxy-Cheap routing for Discord HTTP and WebSocket traffic.
  *
- * Central SOCKS5 proxy layer for all outbound Discord connections.
- *
- * Environment variables (set in .env on the VPS):
- *   PROXY_HOST       — SOCKS5 server hostname or IP
- *   PROXY_PORT       — SOCKS5 server port (e.g. 1080)
- *   PROXY_USERNAME   — optional username for authenticated proxies
- *   PROXY_PASSWORD   — optional password for authenticated proxies
- *
- * When these vars are absent the module is a no-op — direct connections are used.
- * No other file needs to be changed; call setupGlobalFetchProxy() once at boot and
- * every subsequent fetch() call is transparently tunnelled.
+ * Proxy-Cheap uses an HTTP proxy URL. Appending `-session-accN` to the base
+ * username gives each bot instance its own sticky session while keeping the
+ * password and endpoint shared.
  */
 
-import { createRequire } from "node:module";
-import tls from "node:tls";
+import fetch from "node-fetch";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
-const require = createRequire(import.meta.url);
-let SocksClient: any;
-let SocksProxyAgent: any;
+const MAX_PROXY_ACCOUNTS = 50;
+const PROXY_KEYS = [
+  "proxy_cheap_host",
+  "proxy_cheap_port",
+  "proxy_cheap_username",
+  "proxy_cheap_password",
+  "proxy_cheap_account_count",
+];
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+type ProxyConfig = {
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  accountCount: number;
+};
+
+function readEnvConfig(): ProxyConfig {
+  const port = Number(process.env.PROXY_CHEAP_PORT || process.env.PROXY_PORT || 0);
+  const accountCount = Number(
+    process.env.PROXY_CHEAP_ACCOUNT_COUNT ||
+      process.env.PROXY_ACCOUNT_COUNT ||
+      1,
+  );
+  return {
+    host: process.env.PROXY_CHEAP_HOST || process.env.PROXY_HOST || "",
+    port: Number.isInteger(port) ? port : 0,
+    username:
+      process.env.PROXY_CHEAP_USERNAME || process.env.PROXY_USERNAME || "",
+    password:
+      process.env.PROXY_CHEAP_PASSWORD || process.env.PROXY_PASSWORD || "",
+    accountCount:
+      Number.isInteger(accountCount) && accountCount > 0
+        ? Math.min(accountCount, MAX_PROXY_ACCOUNTS)
+        : 1,
+  };
+}
+
+let proxyConfig = readEnvConfig();
+const proxyAgents = new Map<string, HttpsProxyAgent<string>>();
+const sessionSlots = new Map<string, number>();
+let nextSessionSlot = 1;
+let warnedAboutAccountLimit = false;
 
 export function isProxyConfigured(): boolean {
-  return !!(process.env.PROXY_HOST && process.env.PROXY_PORT);
+  return Boolean(proxyConfig.host && proxyConfig.port > 0);
 }
 
-function buildSocksUrl(): string {
-  const host = process.env.PROXY_HOST!;
-  const port = process.env.PROXY_PORT!;
-  const user = process.env.PROXY_USERNAME;
-  const pass = process.env.PROXY_PASSWORD;
-  if (user && pass) {
-    return `socks5://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+export function validateProxySettings(
+  settings: Record<string, unknown>,
+): string | null {
+  const host = String(settings.proxy_cheap_host ?? "").trim();
+  const portValue = String(settings.proxy_cheap_port ?? "").trim();
+  const countValue = String(settings.proxy_cheap_account_count ?? "").trim();
+
+  if ((host && !portValue) || (!host && portValue)) {
+    return "Proxy-Cheap host and port must be provided together";
   }
-  return `socks5://${host}:${port}`;
+  if (portValue) {
+    const port = Number(portValue);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return "Proxy-Cheap port must be between 1 and 65535";
+    }
+  }
+  if (countValue) {
+    const count = Number(countValue);
+    if (!Number.isInteger(count) || count < 1 || count > MAX_PROXY_ACCOUNTS) {
+      return `Proxy-Cheap account count must be between 1 and ${MAX_PROXY_ACCOUNTS}`;
+    }
+  }
+  return null;
 }
 
-// ─── WebSocket agent ──────────────────────────────────────────────────────────
-// Returned value is passed directly to `new WebSocket(url, { agent })`.
-// The ws package forwards it to the underlying TLS/TCP handshake.
-
-// When PROXY_USERNAME_TEMPLATE is set (must contain "{session}"), each account
-// gets its own agent with a per-account session id in the username — most
-// residential proxy providers (IPRoyal, Decodo/Smartproxy, Oxylabs, Webshare…)
-// use this pattern to pin each session to a DIFFERENT sticky exit IP.
-// Example: PROXY_USERNAME_TEMPLATE="myuser-session-{session}"
-// Without the template, all accounts share one agent (single exit IP).
-const _wsAgents = new Map<string, any>();
-
-function buildSocksUrlFor(sessionKey: string | undefined): string {
-  const host = process.env.PROXY_HOST!;
-  const port = process.env.PROXY_PORT!;
-  const template = process.env.PROXY_USERNAME_TEMPLATE;
-  const pass = process.env.PROXY_PASSWORD;
-  if (template && sessionKey) {
-    const user = template.replace("{session}", sessionKey);
-    return `socks5://${encodeURIComponent(user)}:${encodeURIComponent(pass ?? "")}@${host}:${port}`;
-  }
-  return buildSocksUrl();
+function proxyUrl(accountId?: string): string {
+  const session = getSessionTag(accountId);
+  const username = proxyConfig.username
+    ? `${proxyConfig.username}-session-${session}`
+    : "";
+  const auth = username
+    ? `${encodeURIComponent(username)}:${encodeURIComponent(proxyConfig.password)}@`
+    : "";
+  return `http://${auth}${proxyConfig.host}:${proxyConfig.port}`;
 }
 
-export function getWsAgent(accountId?: string): any {
-  if (!isProxyConfigured()) return undefined;
-  if (!SocksProxyAgent) {
-    SocksProxyAgent = require("socks-proxy-agent").SocksProxyAgent;
-  }
-  const usePerAccount = !!(process.env.PROXY_USERNAME_TEMPLATE && accountId);
-  const key = usePerAccount ? accountId! : "__shared__";
-  let agent = _wsAgents.get(key);
+function getProxyAgent(accountId?: string): HttpsProxyAgent<string> {
+  const key = accountId || "__unassigned__";
+  let agent = proxyAgents.get(key);
   if (!agent) {
-    agent = new SocksProxyAgent(buildSocksUrlFor(usePerAccount ? accountId : undefined), {
+    agent = new HttpsProxyAgent(proxyUrl(accountId), {
       keepAlive: true,
-      // Reconnect quickly if the proxy socket drops
       timeout: 30_000,
     });
-    _wsAgents.set(key, agent);
+    proxyAgents.set(key, agent);
   }
   return agent;
 }
 
-// ─── Global fetch proxy ───────────────────────────────────────────────────────
-// Replaces undici's default dispatcher so that every globalThis.fetch() call —
-// in bot.ts, routes.ts, and anywhere else — is tunnelled through SOCKS5
-// automatically, with no per-call changes needed.
+function getSessionTag(accountId?: string): string {
+  if (!accountId) return "acc1";
+  const existing = sessionSlots.get(accountId);
+  if (existing) return `acc${existing}`;
+
+  const slot = nextSessionSlot++;
+  sessionSlots.set(accountId, slot);
+  if (slot > proxyConfig.accountCount && !warnedAboutAccountLimit) {
+    warnedAboutAccountLimit = true;
+    console.warn(
+      `[proxy] More than ${proxyConfig.accountCount} accounts are active; ` +
+        "continuing with unique session tags beyond the configured count",
+    );
+  }
+  return `acc${slot}`;
+}
+
+export function getWsAgent(
+  accountId?: string,
+): HttpsProxyAgent<string> | undefined {
+  if (!isProxyConfigured()) return undefined;
+  return getProxyAgent(accountId);
+}
+
+/**
+ * Use node-fetch here because its `agent` option accepts https-proxy-agent.
+ * Native fetch/undici does not accept a Node HTTP agent on a per-request basis.
+ */
+export function proxyFetch(
+  url: string,
+  init: Record<string, any> = {},
+  accountId?: string,
+): Promise<any> {
+  return fetch(url, {
+    ...init,
+    ...(isProxyConfigured() ? { agent: getProxyAgent(accountId) } : {}),
+  } as any);
+}
+
+export function applyProxySettings(settings: Record<string, unknown>): void {
+  const hasProxySettings = PROXY_KEYS.some((key) =>
+    Object.prototype.hasOwnProperty.call(settings, key),
+  );
+  if (!hasProxySettings) return;
+
+  const current = proxyConfig;
+  const next: ProxyConfig = {
+    host: String(settings.proxy_cheap_host ?? current.host).trim(),
+    port: Number(settings.proxy_cheap_port ?? current.port) || 0,
+    username: String(
+      settings.proxy_cheap_username ?? current.username,
+    ).trim(),
+    password: String(settings.proxy_cheap_password ?? current.password),
+    accountCount:
+      Number(settings.proxy_cheap_account_count ?? current.accountCount) || 1,
+  };
+
+  proxyConfig = {
+    ...next,
+    accountCount: Math.min(
+      Math.max(1, Math.trunc(next.accountCount)),
+      MAX_PROXY_ACCOUNTS,
+    ),
+  };
+  proxyAgents.clear();
+  warnedAboutAccountLimit = false;
+  console.log(
+    isProxyConfigured()
+      ? `[proxy] Proxy-Cheap active → ${proxyConfig.host}:${proxyConfig.port} ` +
+        `(${proxyConfig.accountCount} session slots)`
+      : "[proxy] Proxy-Cheap disabled — using direct connections",
+  );
+}
 
 export async function setupGlobalFetchProxy(): Promise<void> {
-  if (!isProxyConfigured()) {
-    console.log("[proxy] No PROXY_HOST/PROXY_PORT — using direct connections");
-    return;
+  // Load values saved from the Configuration page when present. Environment
+  // variables remain the fallback for VPS deployments that do not use the UI.
+  try {
+    const { storage } = await import("./storage");
+    applyProxySettings(await storage.getConfig());
+  } catch {
+    // MongoDB may not be available during an early boot; env values still work.
   }
 
-  const { Agent, setGlobalDispatcher } = await import("undici");
-  SocksClient = require("socks").SocksClient;
-  SocksProxyAgent = require("socks-proxy-agent").SocksProxyAgent;
-
-  const proxyHost = process.env.PROXY_HOST!;
-  const proxyPort = parseInt(process.env.PROXY_PORT!, 10);
-  const proxyUser = process.env.PROXY_USERNAME;
-  const proxyPass = process.env.PROXY_PASSWORD ?? "";
-
-  const dispatcher = new Agent({
-    // undici calls this connect() once per new TCP connection.
-    // We open a SOCKS5 tunnel to the destination and hand the socket back.
-    connect: (
-      options: any,
-      callback: (err: Error | null, socket: any) => void,
-    ) => {
-      const hostname: string = options.hostname || options.host;
-      const port: number =
-        parseInt(options.port, 10) ||
-        (options.protocol === "https:" ? 443 : 80);
-      const servername: string = options.servername || hostname;
-
-      SocksClient.createConnection({
-        proxy: {
-          host: proxyHost,
-          port: proxyPort,
-          type: 5,
-          ...(proxyUser ? { userId: proxyUser, password: proxyPass } : {}),
-        },
-        command: "connect",
-        destination: { host: hostname, port },
-      })
-        .then(({ socket }) => {
-          if (options.protocol === "https:") {
-            // Upgrade the raw SOCKS tunnel to TLS.
-            // Cipher suite order + ECDH curve preference are chosen to match
-            // Chrome's JA3/JA4 TLS fingerprint as closely as Node.js allows.
-            // Node's own default order differs significantly and is trivially
-            // identified by Cloudflare's TLS fingerprinting layer.
-            const tlsSocket = tls.connect({
-              socket,
-              servername,
-              rejectUnauthorized: true,
-              // Chrome-like cipher preference order (TLS 1.3 first, then 1.2)
-              ciphers: [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "ECDHE-ECDSA-AES128-GCM-SHA256",
-                "ECDHE-RSA-AES128-GCM-SHA256",
-                "ECDHE-ECDSA-AES256-GCM-SHA384",
-                "ECDHE-RSA-AES256-GCM-SHA384",
-                "ECDHE-ECDSA-CHACHA20-POLY1305",
-                "ECDHE-RSA-CHACHA20-POLY1305",
-                "ECDHE-RSA-AES128-SHA",
-                "ECDHE-RSA-AES256-SHA",
-                "AES128-GCM-SHA256",
-                "AES256-GCM-SHA384",
-                "AES128-SHA",
-                "AES256-SHA",
-              ].join(":"),
-              // Chrome's ECDH curve priority: X25519 first (fastest), then NIST curves
-              ecdhCurve: "X25519:P-256:P-384:P-521",
-              // Chrome supports TLS 1.2 minimum, 1.3 preferred
-              minVersion: "TLSv1.2" as any,
-              maxVersion: "TLSv1.3" as any,
-              // Do NOT honor server cipher order — Chrome doesn't (client-preferred)
-              honorCipherOrder: false,
-            });
-            tlsSocket.once("secureConnect", () => callback(null, tlsSocket));
-            tlsSocket.once("error", callback);
-          } else {
-            callback(null, socket);
-          }
-        })
-        .catch((err: Error) => callback(err, null));
-    },
-
-    // Keep connections alive so the proxy tunnel is reused across requests
-    // rather than torn down and rebuilt on every Discord API call.
-    keepAliveTimeout: 30_000,
-    keepAliveMaxTimeout: 60_000,
-    connections: 50,
-    pipelining: 1,
-  });
-
-  setGlobalDispatcher(dispatcher);
-
-  const auth = proxyUser ? ` (authenticated as ${proxyUser})` : "";
-  console.log(`[proxy] SOCKS5 active → ${proxyHost}:${proxyPort}${auth}`);
+  if (!isProxyConfigured()) {
+    console.log("[proxy] No Proxy-Cheap host/port — using direct connections");
+  }
 }
