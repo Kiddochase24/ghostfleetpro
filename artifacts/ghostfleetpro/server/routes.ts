@@ -3,7 +3,7 @@ import type { Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { initBotEngine, sendTestMessage, getGatewayStatus, refreshSessions, invalidateRulesCache, getDevFleetEnabled, setDevFleetEnabled, syncRosterFromRules, setPrimaryAccount, clearPrimaryAccount, recomputeRotation, getRosterHealthSnapshot } from "./bot";
-import { applyProxySettings, proxyFetch, validateProxySettings } from "./proxy";
+import { applyProxySettings, proxyFetch, releaseProxy, validateProxySettings } from "./proxy";
 import { z } from "zod";
 import os from "os";
 import crypto from "crypto";
@@ -465,8 +465,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // Use a temporary fingerprint keyed on the token itself (account ID not known yet)
       const tempHeaders = accountHeaders(crypto.createHash("md5").update(token).digest("hex"), token);
       // The account ID is not known until this request succeeds, so use the
-      // shared bootstrap session. Subsequent account traffic uses the real ID.
-      const meRes = await proxyFetch(`${DISCORD_API}/users/@me`, { headers: tempHeaders });
+      // short-lived token-keyed bootstrap lease. It is always released before
+      // the account gets its permanent account-id lease.
+      const bootstrapAccountId = `bootstrap-${crypto.createHash("sha256").update(token).digest("hex")}`;
+      let meRes: any;
+      try {
+        meRes = await proxyFetch(
+          `${DISCORD_API}/users/@me`,
+          { headers: tempHeaders },
+          bootstrapAccountId,
+        );
+      } finally {
+        releaseProxy(bootstrapAccountId);
+      }
       const latency = Date.now() - start;
 
       if (!meRes.ok) {
@@ -514,6 +525,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.delete("/api/accounts/:id", async (req, res) => {
     const wsId = getWorkspaceId(req);
     await storage.deleteAccount(req.params.id);
+    releaseProxy(req.params.id);
     bustCache("accounts:");
     logToConsole(`ACCOUNT REMOVED: ${req.params.id}`, wsId);
     res.status(204).send();
@@ -527,6 +539,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const { res: guildsRes } = await discordFetch("/users/@me/guilds", acc.token, acc.id);
       if (!guildsRes.ok) {
         await storage.updateAccountStatus(acc.id, "Disconnected");
+        releaseProxy(acc.id);
         return res.status(401).json({ error: "Token invalid or expired" });
       }
       const guilds = await guildsRes.json() as any[];

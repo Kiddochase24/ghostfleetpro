@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import OpenAI from "openai";
 import { storage } from "./storage";
 import { getDb } from "./db";
-import { getWsAgent, proxyFetch } from "./proxy";
+import { getWsAgent, proxyFetch, releaseProxy } from "./proxy";
 
 // OpenAI client — lazy singleton so that adding OPENAI_API_KEY after startup
 // is picked up on the next classify call without a server restart.
@@ -759,6 +759,8 @@ async function checkAccountToken(account: any): Promise<boolean | null> {
         if (response.status === 401 || response.status === 403) {
           tokenHealth.set(account.id, { valid: false, checkedAt: Date.now(), token: account.token });
           await storage.updateAccountStatus(account.id, "Disconnected");
+          releaseProxy(account.id);
+          closeSession(account.id);
           return false;
         }
         return cached?.valid ?? null;
@@ -1126,7 +1128,7 @@ async function syncSessions() {
     // When the fleet is active, every stored account with a token remains in
     // the session set. Account status/health must not gate reply attempts.
     const connected = isFleetActive()
-      ? accounts.filter((a) => !!a.token)
+      ? accounts.filter((a) => a.status === "Connected" && !!a.token)
       : [];
 
     // All opens go through one bounded queue. This includes the first fleet
@@ -1367,6 +1369,7 @@ function openSession(accountId: string, accountName: string, token: string) {
         `⚠ TOKEN INVALID/BANNED: ${accountName} (code ${code}) — marking disconnected`,
       );
       storage.updateAccountStatus(accountId, "Disconnected").catch(() => {});
+      releaseProxy(accountId);
       gatewayStatus.set(accountId, "dead");
     }
   });
@@ -1410,6 +1413,7 @@ function closeSession(accountId: string) {
   sessions.delete(accountId);
   gatewayStatus.delete(accountId);
   gatewayAccountNames.delete(accountId);
+  releaseProxy(accountId);
   // This path is also used when the DB account is manually disconnected, so
   // do not wait for the websocket close event to release roster ownership.
   recomputeAccountRotations(accountId).catch(() => {});
