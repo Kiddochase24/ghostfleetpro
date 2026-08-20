@@ -1099,7 +1099,12 @@ function pumpGatewayOpenQueue() {
         // A synchronous constructor failure must not strand the rest of the
         // fleet or leave this account marked as permanently connecting.
         gatewayStatus.set(entry.accountId, "dead");
-        gatewayOpenQueue.set(entry.accountId, entry);
+        releaseProxy(entry.accountId);
+        broadcastFn("gatewayStatus", {
+          accountId: entry.accountId,
+          accountName: entry.accountName,
+          status: "dead",
+        });
         logFn(
           `GATEWAY OPEN ERR: ${entry.accountName}: ${error?.message || error}`,
         );

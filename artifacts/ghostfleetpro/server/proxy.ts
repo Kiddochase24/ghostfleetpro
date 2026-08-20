@@ -93,7 +93,6 @@ const proxyLeases = new Map<string, ProxyLease>();
 const freePoolKeys = new Set<string>();
 const freeLegacySessionSlots = new Set<number>();
 const proxyFailureCounts = new Map<string, number>();
-const directFallbackAccounts = new Set<string>();
 let warnedAboutProxyExhaustion = false;
 const PROXY_FAILURES_BEFORE_DIRECT = 2;
 
@@ -226,21 +225,19 @@ export function recordProxySuccess(accountId: string): void {
 }
 
 export function recordProxyFailure(accountId: string, error?: unknown): boolean {
-  // Once an account has switched to the VPS IP, direct-connection errors must
-  // not keep incrementing the SOCKS failure counter or emit proxy warnings.
-  if (!proxyLeases.has(accountId)) return directFallbackAccounts.has(accountId);
+  // Keep configured proxy traffic fail-closed. Falling back to the VPS IP would
+  // break sticky routing and put every account behind one Discord-facing IP.
+  if (!proxyLeases.has(accountId)) return false;
   const failures = (proxyFailureCounts.get(accountId) || 0) + 1;
   proxyFailureCounts.set(accountId, failures);
   if (failures < PROXY_FAILURES_BEFORE_DIRECT) return false;
 
-  directFallbackAccounts.add(accountId);
-  releaseProxy(accountId);
   console.warn(
     `[proxy] Account ${accountId} failed through SOCKS ${failures} times; ` +
-      "falling back to the VPS IP" +
+      "keeping the sticky proxy lease and waiting for reconnect" +
       (error instanceof Error ? ` (${error.message})` : ""),
   );
-  return true;
+  return false;
 }
 
 async function isProxyAuthenticationResponse(response: any): Promise<boolean> {
@@ -261,7 +258,7 @@ async function isProxyAuthenticationResponse(response: any): Promise<boolean> {
 export function getWsAgent(
   accountId?: string,
 ): Agent | undefined {
-  if (!isProxyConfigured() || (accountId && directFallbackAccounts.has(accountId))) {
+  if (!isProxyConfigured()) {
     return undefined;
   }
   return getProxyLease(accountId).agent;
@@ -276,7 +273,7 @@ export async function proxyFetch(
   init: Record<string, any> = {},
   accountId?: string,
 ): Promise<any> {
-  if (!isProxyConfigured() || (accountId && directFallbackAccounts.has(accountId))) {
+  if (!isProxyConfigured()) {
     return fetch(url, init as any);
   }
   for (let attempt = 1; attempt <= PROXY_FAILURES_BEFORE_DIRECT; attempt++) {
@@ -287,21 +284,18 @@ export async function proxyFetch(
         agent: lease.agent,
       } as any);
       if (await isProxyAuthenticationResponse(response)) {
-        const switchedToDirect = accountId
-          ? recordProxyFailure(accountId, new Error(`proxy returned HTTP ${response.status}`))
-          : false;
-        if (switchedToDirect) return fetch(url, init as any);
+        if (accountId) {
+          recordProxyFailure(
+            accountId,
+            new Error(`proxy returned HTTP ${response.status}`),
+          );
+        }
         continue;
       }
       recordProxySuccess(accountId || "__bootstrap__");
       return response;
     } catch (error) {
-      const switchedToDirect = accountId
-        ? recordProxyFailure(accountId, error)
-        : false;
-      if (switchedToDirect) {
-        return fetch(url, init as any);
-      }
+      if (accountId) recordProxyFailure(accountId, error);
       if (attempt === PROXY_FAILURES_BEFORE_DIRECT) throw error;
     }
   }
@@ -335,7 +329,6 @@ export function applyProxySettings(settings: Record<string, unknown>): void {
     if (accountId !== "__bootstrap__") releaseProxy(accountId);
   }
   proxyFailureCounts.clear();
-  directFallbackAccounts.clear();
   const bootstrap = proxyLeases.get("__bootstrap__");
   if (bootstrap) {
     proxyLeases.delete("__bootstrap__");
