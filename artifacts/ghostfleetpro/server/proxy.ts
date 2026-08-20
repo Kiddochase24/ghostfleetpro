@@ -91,6 +91,7 @@ function readEnvConfig(): ProxyConfig {
 let proxyConfig = readEnvConfig();
 const proxyLeases = new Map<string, ProxyLease>();
 const freePoolKeys = new Set<string>();
+const freeLegacySessionSlots = new Set<number>();
 const proxyFailureCounts = new Map<string, number>();
 const directFallbackAccounts = new Set<string>();
 let warnedAboutProxyExhaustion = false;
@@ -99,6 +100,12 @@ const PROXY_FAILURES_BEFORE_DIRECT = 2;
 function resetFreePool(): void {
   freePoolKeys.clear();
   proxyConfig.pool.forEach((_, index) => freePoolKeys.add(String(index)));
+  freeLegacySessionSlots.clear();
+  if (proxyConfig.pool.length === 0) {
+    for (let slot = 1; slot <= proxyConfig.accountCount; slot++) {
+      freeLegacySessionSlots.add(slot);
+    }
+  }
 }
 
 resetFreePool();
@@ -136,15 +143,9 @@ export function validateProxySettings(
   return null;
 }
 
-function proxyUrl(accountId?: string): string {
-  if (proxyConfig.pool.length > 0) {
-    return proxyLeases.get(accountId || "")?.url || proxyConfig.pool[0];
-  }
-  const sessionSuffix = accountId
-    ? `-session-${accountId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48)}`
-    : "";
+function legacyProxyUrl(sessionSlot: number): string {
   const username = proxyConfig.username
-    ? encodeURIComponent(`${proxyConfig.username}${sessionSuffix}`)
+    ? encodeURIComponent(`${proxyConfig.username}-session-acc${sessionSlot}`)
     : "";
   const auth = username
     ? `${username}:${encodeURIComponent(proxyConfig.password)}@`
@@ -186,8 +187,18 @@ function getProxyLease(accountId?: string): ProxyLease {
     return lease;
   }
 
-  const url = proxyUrl(accountId);
-  const lease = { key: "__shared__", url, agent: createAgent(url) };
+  const sessionSlot = freeLegacySessionSlots.values().next().value as number | undefined;
+  if (sessionSlot === undefined) {
+    throw new Error(
+      `No free Proxy-Cheap session slot is available (configured for ${proxyConfig.accountCount} accounts)`,
+    );
+  }
+  freeLegacySessionSlots.delete(sessionSlot);
+  const lease = {
+    key: `session-${sessionSlot}`,
+    url: legacyProxyUrl(sessionSlot),
+    agent: createAgent(legacyProxyUrl(sessionSlot)),
+  };
   proxyLeases.set(leaseKey, lease);
   return lease;
 }
@@ -196,9 +207,14 @@ export function releaseProxy(accountId: string): void {
   const lease = proxyLeases.get(accountId);
   if (!lease) return;
   proxyLeases.delete(accountId);
-  if (proxyConfig.pool.length > 0 && lease.key !== "__shared__") {
-    freePoolKeys.add(lease.key);
-    warnedAboutProxyExhaustion = false;
+  if (proxyConfig.pool.length > 0) {
+    if (lease.key !== "__shared__") {
+      freePoolKeys.add(lease.key);
+      warnedAboutProxyExhaustion = false;
+    }
+  } else {
+    const sessionMatch = /^session-(\d+)$/.exec(lease.key);
+    if (sessionMatch) freeLegacySessionSlots.add(Number(sessionMatch[1]));
   }
   const destroy = (lease.agent as Agent & { destroy?: () => void }).destroy;
   destroy?.call(lease.agent);
