@@ -481,7 +481,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const latency = Date.now() - start;
 
       if (!meRes.ok) {
-        return res.status(401).json({ error: `Discord rejected token (${meRes.status}). Make sure it's a valid user token.` });
+        const responseBody = await meRes.clone().text().catch(() => "");
+        const proxyChallenge = meRes.headers.get("www-authenticate");
+        const responseServer = meRes.headers.get("server");
+        console.warn(
+          `[proxy] Account validation returned HTTP ${meRes.status}` +
+            `${responseServer ? ` server=${responseServer}` : ""}` +
+            `${proxyChallenge ? " with an authentication challenge" : ""}` +
+            `${responseBody ? ` body=${responseBody.slice(0, 180)}` : ""}`,
+        );
+        return res.status(401).json({
+          error: `Account validation returned HTTP ${meRes.status}.`,
+          detail: responseBody.slice(0, 240),
+          likelyProxyAuth: meRes.status === 407 || !!proxyChallenge,
+        });
       }
 
       const user = await meRes.json() as any;

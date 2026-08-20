@@ -2,7 +2,13 @@ import WebSocket from "ws";
 import OpenAI from "openai";
 import { storage } from "./storage";
 import { getDb } from "./db";
-import { getWsAgent, proxyFetch, releaseProxy } from "./proxy";
+import {
+  getWsAgent,
+  proxyFetch,
+  recordProxyFailure,
+  recordProxySuccess,
+  releaseProxy,
+} from "./proxy";
 
 // OpenAI client — lazy singleton so that adding OPENAI_API_KEY after startup
 // is picked up on the next classify call without a server restart.
@@ -655,6 +661,16 @@ function enqueueChannelSend(
   });
 }
 
+function humanReplyDelayMs(rule: any): number {
+  const configured = Number(rule.delayMs) || 0;
+  // Even "Instant" gets a short, randomized pause. Very small configured
+  // values are raised to a practical floor so replies do not arrive at
+  // machine cadence, while longer custom delays retain their intent.
+  const base = Math.max(500, configured);
+  const jitter = base * (0.2 + Math.random() * 0.35);
+  return Math.max(350, Math.round(base - base * 0.2 + jitter));
+}
+
 // Per-session gateway status (separate from DB account status)
 export const gatewayStatus: Map<string, "connecting" | "ready" | "dead"> =
   new Map();
@@ -1223,6 +1239,7 @@ function openSession(accountId: string, accountName: string, token: string) {
   // idle proxy tunnels. Discord's gateway heartbeat is application-level and
   // should not be the only thing keeping the transport alive.
   ws.on("open", () => {
+    recordProxySuccess(accountId);
     const socket = (ws as any)._socket as {
       setKeepAlive?: (enable: boolean, initialDelay?: number) => void;
       setNoDelay?: (noDelay?: boolean) => void;
@@ -1376,6 +1393,7 @@ function openSession(accountId: string, accountName: string, token: string) {
 
   ws.on("error", (err) => {
     logFn(`GATEWAY ERR: ${accountName}: ${err.message}`);
+    recordProxyFailure(accountId, err);
     // ws normally emits close after error, but terminate explicitly so a
     // transport error can never leave the account stuck in "connecting".
     if (sessions.get(accountId) === session) {
@@ -2235,7 +2253,7 @@ async function onMessage(msg: any, s: GatewaySession) {
     }
     // "any" trigger — fires on every message in matched channel/server
 
-    const delayMs = rule.delayMs ?? 0;
+    const delayMs = humanReplyDelayMs(rule);
     const chInfo = channels.find((c: any) => c.id === channelId);
     const srvInfo = servers.find((sv: any) => sv.id === guildId);
     const ruleId = rule.id;

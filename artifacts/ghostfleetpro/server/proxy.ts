@@ -91,7 +91,10 @@ function readEnvConfig(): ProxyConfig {
 let proxyConfig = readEnvConfig();
 const proxyLeases = new Map<string, ProxyLease>();
 const freePoolKeys = new Set<string>();
+const proxyFailureCounts = new Map<string, number>();
+const directFallbackAccounts = new Set<string>();
 let warnedAboutProxyExhaustion = false;
+const PROXY_FAILURES_BEFORE_DIRECT = 2;
 
 function resetFreePool(): void {
   freePoolKeys.clear();
@@ -202,10 +205,49 @@ export function releaseProxy(accountId: string): void {
   console.log(`[proxy] Released ${lease.url.replace(/\/\/.*@/, "//***@")} from account ${accountId}`);
 }
 
+export function recordProxySuccess(accountId: string): void {
+  proxyFailureCounts.delete(accountId);
+}
+
+export function recordProxyFailure(accountId: string, error?: unknown): boolean {
+  // Once an account has switched to the VPS IP, direct-connection errors must
+  // not keep incrementing the SOCKS failure counter or emit proxy warnings.
+  if (!proxyLeases.has(accountId)) return directFallbackAccounts.has(accountId);
+  const failures = (proxyFailureCounts.get(accountId) || 0) + 1;
+  proxyFailureCounts.set(accountId, failures);
+  if (failures < PROXY_FAILURES_BEFORE_DIRECT) return false;
+
+  directFallbackAccounts.add(accountId);
+  releaseProxy(accountId);
+  console.warn(
+    `[proxy] Account ${accountId} failed through SOCKS ${failures} times; ` +
+      "falling back to the VPS IP" +
+      (error instanceof Error ? ` (${error.message})` : ""),
+  );
+  return true;
+}
+
+async function isProxyAuthenticationResponse(response: any): Promise<boolean> {
+  if (response.status === 407) return true;
+  if (response.status !== 401) return false;
+  const challenge = response.headers?.get?.("www-authenticate");
+  if (challenge) return true;
+  try {
+    const body = await response.clone().text();
+    // Discord's normal invalid-token response is {"message":"401: Unauthorized","code":0}.
+    // A different/empty 401 body is commonly the proxy provider rejecting auth.
+    return !/"code"\s*:\s*0/.test(body) && !/401:\s*Unauthorized/i.test(body);
+  } catch {
+    return false;
+  }
+}
+
 export function getWsAgent(
   accountId?: string,
 ): Agent | undefined {
-  if (!isProxyConfigured()) return undefined;
+  if (!isProxyConfigured() || (accountId && directFallbackAccounts.has(accountId))) {
+    return undefined;
+  }
   return getProxyLease(accountId).agent;
 }
 
@@ -213,17 +255,41 @@ export function getWsAgent(
  * Use node-fetch here because its `agent` option accepts https-proxy-agent.
  * Native fetch/undici does not accept a Node HTTP agent on a per-request basis.
  */
-export function proxyFetch(
+export async function proxyFetch(
   url: string,
   init: Record<string, any> = {},
   accountId?: string,
 ): Promise<any> {
-  if (!isProxyConfigured()) return fetch(url, init as any);
-  const lease = getProxyLease(accountId);
-  return fetch(url, {
-    ...init,
-    agent: lease.agent,
-  } as any);
+  if (!isProxyConfigured() || (accountId && directFallbackAccounts.has(accountId))) {
+    return fetch(url, init as any);
+  }
+  for (let attempt = 1; attempt <= PROXY_FAILURES_BEFORE_DIRECT; attempt++) {
+    const lease = getProxyLease(accountId);
+    try {
+      const response = await fetch(url, {
+        ...init,
+        agent: lease.agent,
+      } as any);
+      if (await isProxyAuthenticationResponse(response)) {
+        const switchedToDirect = accountId
+          ? recordProxyFailure(accountId, new Error(`proxy returned HTTP ${response.status}`))
+          : false;
+        if (switchedToDirect) return fetch(url, init as any);
+        continue;
+      }
+      recordProxySuccess(accountId || "__bootstrap__");
+      return response;
+    } catch (error) {
+      const switchedToDirect = accountId
+        ? recordProxyFailure(accountId, error)
+        : false;
+      if (switchedToDirect) {
+        return fetch(url, init as any);
+      }
+      if (attempt === PROXY_FAILURES_BEFORE_DIRECT) throw error;
+    }
+  }
+  throw new Error("Proxy request failed");
 }
 
 export function applyProxySettings(settings: Record<string, unknown>): void {
@@ -252,6 +318,8 @@ export function applyProxySettings(settings: Record<string, unknown>): void {
   for (const accountId of Array.from(proxyLeases.keys())) {
     if (accountId !== "__bootstrap__") releaseProxy(accountId);
   }
+  proxyFailureCounts.clear();
+  directFallbackAccounts.clear();
   const bootstrap = proxyLeases.get("__bootstrap__");
   if (bootstrap) {
     proxyLeases.delete("__bootstrap__");
