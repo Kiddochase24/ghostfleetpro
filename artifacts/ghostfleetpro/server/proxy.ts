@@ -58,7 +58,19 @@ function parseProxyPool(raw: unknown): string[] {
     new Set(
       values
         .map((entry) => String(entry).trim())
-        .filter((entry) => /^(socks4|socks4a|socks5|socks5h|http|https):\/\//i.test(entry)),
+        .map((entry) => {
+          // Proxy-Cheap's exported PROXY_URLS value omits the scheme:
+          // username:password@host:port. Treat those entries as HTTP proxies
+          // while preserving fully-qualified SOCKS/HTTP URLs unchanged.
+          if (/^(socks4|socks4a|socks5|socks5h|http|https):\/\//i.test(entry)) {
+            return entry;
+          }
+          if (/^[^@\s]+@[^:\s]+:\d+$/.test(entry)) {
+            return `http://${entry}`;
+          }
+          return "";
+        })
+        .filter(Boolean),
     ),
   );
 }
@@ -83,6 +95,7 @@ function readEnvConfig(): ProxyConfig {
         : 1,
     pool: parseProxyPool(
       process.env.SOCKS_PROXIES ||
+        process.env.PROXY_URLS ||
         process.env.PROXY_POOL ||
         process.env.SOCKS_PROXY_POOL,
     ),
