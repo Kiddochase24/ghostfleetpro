@@ -94,8 +94,8 @@ function readEnvConfig(): ProxyConfig {
         ? Math.min(accountCount, MAX_PROXY_ACCOUNTS)
         : 1,
     pool: parseProxyPool(
-      process.env.SOCKS_PROXIES ||
-        process.env.PROXY_URLS ||
+      process.env.PROXY_URLS ||
+        process.env.SOCKS_PROXIES ||
         process.env.PROXY_POOL ||
         process.env.SOCKS_PROXY_POOL,
     ),
@@ -109,6 +109,10 @@ const freeLegacySessionSlots = new Set<number>();
 const proxyFailureCounts = new Map<string, number>();
 let warnedAboutProxyExhaustion = false;
 const PROXY_FAILURES_BEFORE_RETRY = 2;
+
+function getEnvProxyPool(): string[] {
+  return parseProxyPool(process.env.PROXY_URLS);
+}
 
 function resetFreePool(): void {
   freePoolKeys.clear();
@@ -197,6 +201,10 @@ function getProxyLease(accountId?: string): ProxyLease {
     const url = proxyConfig.pool[Number(poolKey)];
     const lease = { key: poolKey, url, agent: createAgent(url) };
     proxyLeases.set(leaseKey, lease);
+    console.log(
+      `[proxy] Leased explicit pool entry #${Number(poolKey) + 1} to ` +
+        `${accountId || "bootstrap"}`,
+    );
     return lease;
   }
 
@@ -431,11 +439,17 @@ export function applyProxySettings(settings: Record<string, unknown>): void {
     password: String(settings.proxy_cheap_password ?? current.password),
     accountCount:
       Number(settings.proxy_cheap_account_count ?? current.accountCount) || 1,
-    pool: parseProxyPool(
-      settings.proxy_pool ??
-        settings.socks_proxies ??
-        current.pool.join("\n"),
-    ),
+    // An explicit PROXY_URLS environment pool is authoritative. This prevents
+    // stale dashboard config (especially an empty proxy_pool field) from
+    // silently replacing the per-session URLs supplied by the deployment.
+    pool:
+      getEnvProxyPool().length > 0
+        ? getEnvProxyPool()
+        : parseProxyPool(
+            settings.proxy_pool ??
+              settings.socks_proxies ??
+              current.pool.join("\n"),
+          ),
   };
 
   for (const accountId of Array.from(proxyLeases.keys())) {
@@ -459,7 +473,7 @@ export function applyProxySettings(settings: Record<string, unknown>): void {
   console.log(
     isProxyConfigured()
       ? proxyConfig.pool.length > 0
-        ? `[proxy] SOCKS proxy pool active (${proxyConfig.pool.length} free proxies)`
+        ? `[proxy] Explicit proxy URL pool active (${proxyConfig.pool.length} free sessions)`
         : `[proxy] Proxy-Cheap active → ${proxyConfig.host}:${proxyConfig.port}`
       : "[proxy] Proxy-Cheap disabled — using direct connections",
   );
