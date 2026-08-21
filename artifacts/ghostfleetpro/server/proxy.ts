@@ -2,7 +2,8 @@
  * Per-account proxy routing for Discord HTTP and WebSocket traffic.
  *
  * Preferred mode is an explicit SOCKS/HTTP proxy pool. Each account leases
- * one URL for its lifetime and the URL is returned to the pool on release.
+ * one URL for its lifetime. A normal Discord gateway reconnect keeps that
+ * lease; only a proxy transport/auth failure replaces it.
  * The legacy Proxy-Cheap single-endpoint mode remains supported as a fallback.
  */
 
@@ -94,7 +95,7 @@ const freePoolKeys = new Set<string>();
 const freeLegacySessionSlots = new Set<number>();
 const proxyFailureCounts = new Map<string, number>();
 let warnedAboutProxyExhaustion = false;
-const PROXY_FAILURES_BEFORE_DIRECT = 2;
+const PROXY_FAILURES_BEFORE_RETRY = 2;
 
 function resetFreePool(): void {
   freePoolKeys.clear();
@@ -220,6 +221,92 @@ export function releaseProxy(accountId: string): void {
   console.log(`[proxy] Released ${lease.url.replace(/\/\/.*@/, "//***@")} from account ${accountId}`);
 }
 
+/**
+ * Replace an account's proxy session after the transport itself failed.
+ * Prefer a different free session slot. The old slot is returned only after
+ * the replacement has been allocated so a failed slot cannot be immediately
+ * selected again. If all configured slots are occupied, fail closed rather
+ * than moving another account or connecting directly.
+ */
+export function replaceProxySession(accountId: string): boolean {
+  const current = proxyLeases.get(accountId);
+  if (!current) return false;
+
+  if (proxyConfig.pool.length > 0) {
+    const replacementKey = Array.from(freePoolKeys).find(
+      (key) => key !== current.key,
+    );
+    if (replacementKey === undefined) {
+      console.warn(
+        `[proxy] No unused SOCKS session is available to replace account ${accountId}; ` +
+          "keeping the account offline instead of reusing a failed session",
+      );
+      return false;
+    }
+    freePoolKeys.delete(replacementKey);
+    proxyLeases.set(accountId, {
+      key: replacementKey,
+      url: proxyConfig.pool[Number(replacementKey)],
+      agent: createAgent(proxyConfig.pool[Number(replacementKey)]),
+    });
+    freePoolKeys.add(current.key);
+    (current.agent as Agent & { destroy?: () => void }).destroy?.();
+    proxyFailureCounts.delete(accountId);
+    console.log(
+      `[proxy] Replaced failed session for account ${accountId}: ` +
+        `${current.url.replace(/\/\/.*@/, "//***@")} → ` +
+        `${proxyConfig.pool[Number(replacementKey)].replace(/\/\/.*@/, "//***@")}`,
+    );
+    return true;
+  }
+
+  const replacementSlot = Array.from(freeLegacySessionSlots).find(
+    (slot) => `session-${slot}` !== current.key,
+  );
+  if (replacementSlot === undefined) {
+    console.warn(
+      `[proxy] No unused Proxy-Cheap session is available to replace account ${accountId}; ` +
+        "keeping the account offline instead of reusing a failed session",
+    );
+    return false;
+  }
+  freeLegacySessionSlots.delete(replacementSlot);
+  const replacementUrl = legacyProxyUrl(replacementSlot);
+  proxyLeases.set(accountId, {
+    key: `session-${replacementSlot}`,
+    url: replacementUrl,
+    agent: createAgent(replacementUrl),
+  });
+  const oldSlot = /^session-(\d+)$/.exec(current.key);
+  if (oldSlot) freeLegacySessionSlots.add(Number(oldSlot[1]));
+  (current.agent as Agent & { destroy?: () => void }).destroy?.();
+  proxyFailureCounts.delete(accountId);
+  console.log(
+    `[proxy] Replaced failed session for account ${accountId}: ` +
+      `${current.url.replace(/\/\/.*@/, "//***@")} → ` +
+      `${replacementUrl.replace(/\/\/.*@/, "//***@")}`,
+  );
+  return true;
+}
+
+/**
+ * Remove a failed session without returning its slot to the free pool.
+ * The provider slot is quarantined until the process/configuration is
+ * refreshed; this prevents an immediate retry from selecting the same dead
+ * session when no replacement was available.
+ */
+export function invalidateProxySession(accountId: string): void {
+  const lease = proxyLeases.get(accountId);
+  if (!lease) return;
+  proxyLeases.delete(accountId);
+  (lease.agent as Agent & { destroy?: () => void }).destroy?.();
+  proxyFailureCounts.delete(accountId);
+  console.warn(
+    `[proxy] Quarantined failed session for account ${accountId}: ` +
+      lease.url.replace(/\/\/.*@/, "//***@"),
+  );
+}
+
 export function recordProxySuccess(accountId: string): void {
   proxyFailureCounts.delete(accountId);
 }
@@ -230,11 +317,11 @@ export function recordProxyFailure(accountId: string, error?: unknown): boolean 
   if (!proxyLeases.has(accountId)) return false;
   const failures = (proxyFailureCounts.get(accountId) || 0) + 1;
   proxyFailureCounts.set(accountId, failures);
-  if (failures < PROXY_FAILURES_BEFORE_DIRECT) return false;
+  if (failures < PROXY_FAILURES_BEFORE_RETRY) return false;
 
   console.warn(
     `[proxy] Account ${accountId} failed through SOCKS ${failures} times; ` +
-      "keeping the sticky proxy lease and waiting for reconnect" +
+      "the next request/reconnect will use a replacement session" +
       (error instanceof Error ? ` (${error.message})` : ""),
   );
   return false;
@@ -276,7 +363,7 @@ export async function proxyFetch(
   if (!isProxyConfigured()) {
     return fetch(url, init as any);
   }
-  for (let attempt = 1; attempt <= PROXY_FAILURES_BEFORE_DIRECT; attempt++) {
+  for (let attempt = 1; attempt <= PROXY_FAILURES_BEFORE_RETRY; attempt++) {
     const lease = getProxyLease(accountId);
     try {
       const response = await fetch(url, {
@@ -289,14 +376,27 @@ export async function proxyFetch(
             accountId,
             new Error(`proxy returned HTTP ${response.status}`),
           );
+          if (!replaceProxySession(accountId)) {
+            invalidateProxySession(accountId);
+            throw new Error("Proxy session was rejected and no replacement is available");
+          }
         }
         continue;
       }
       recordProxySuccess(accountId || "__bootstrap__");
       return response;
     } catch (error) {
-      if (accountId) recordProxyFailure(accountId, error);
-      if (attempt === PROXY_FAILURES_BEFORE_DIRECT) throw error;
+      if (accountId) {
+        recordProxyFailure(accountId, error);
+        if (!replaceProxySession(accountId)) {
+          invalidateProxySession(accountId);
+          throw error;
+        }
+      }
+      if (attempt === PROXY_FAILURES_BEFORE_RETRY) {
+        if (accountId) invalidateProxySession(accountId);
+        throw error;
+      }
     }
   }
   throw new Error("Proxy request failed");

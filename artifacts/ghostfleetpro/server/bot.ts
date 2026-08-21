@@ -4,10 +4,12 @@ import { storage } from "./storage";
 import { getDb } from "./db";
 import {
   getWsAgent,
+  invalidateProxySession,
   proxyFetch,
   recordProxyFailure,
   recordProxySuccess,
   releaseProxy,
+  replaceProxySession,
 } from "./proxy";
 
 // OpenAI client — lazy singleton so that adding OPENAI_API_KEY after startup
@@ -1399,6 +1401,22 @@ function openSession(accountId: string, accountName: string, token: string) {
   ws.on("error", (err) => {
     logFn(`GATEWAY ERR: ${accountName}: ${err.message}`);
     recordProxyFailure(accountId, err);
+    // A Discord gateway close without a transport error keeps the account's
+    // sticky Proxy-Cheap session. A socket error invalidates that session;
+    // obtain a different provider session before the close handler queues the
+    // reconnect. If all 50 slots are occupied, fail closed instead of reusing
+    // a known-dead session or connecting directly.
+    const replaced = replaceProxySession(accountId);
+    if (!replaced) {
+      invalidateProxySession(accountId);
+      gatewayStatus.set(accountId, "dead");
+      broadcastFn("gatewayAlert", {
+        type: "proxy_recovery_blocked",
+        accountId,
+        accountName,
+        msg: `No replacement proxy session is available for ${accountName}`,
+      });
+    }
     // ws normally emits close after error, but terminate explicitly so a
     // transport error can never leave the account stuck in "connecting".
     if (sessions.get(accountId) === session) {
