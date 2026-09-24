@@ -405,6 +405,15 @@ function localClassifyMessage(
     /\bi('ve| have) (done|been through|dealt with) (this|it|that)\b/,
     /\banyone (who )?needs? (help|assistance|support)\b/,
     /\bi('ll| will) (take care|handle|sort)\b/,
+    // Redirecting others to support channels instead of asking for help
+    /\b(open|create|make|raise|submit) an? (support )?ticket\b/,
+    /\bkindly (open|create|request|contact|reach)\b/,
+    /\bask (the )?(team|mods?|admins?|support|devs?)\b/,
+    /\b(contact|reach out to) (the )?(team|mods?|admins?|support|devs?)\b/,
+    /\b(check|read) (the )?(faq|docs|pinned|announcements?)\b/,
+    /\byou (need|have|should) to\b/, /\btry (clearing|reconnecting|refreshing)\b/,
+    // Masked / shortened links are a scam signal, never a genuine request
+    /\[[^\]]*\]\(https?:\/\//, /\b(bit\.ly|tinyurl|t\.co|cutt\.ly|rb\.gy|is\.gd)\//,
   ];
   const isOfferingHelp = offeringHelpPatterns.some((p) => p.test(text));
   if (isOfferingHelp) {
@@ -428,7 +437,9 @@ function localClassifyMessage(
     /\bcan'?t figure\b/, /\bnot really sure\b/, /\bunfamiliar\b/,
   ];
   const issueScore = issuePatterns.filter((p) => p.test(text)).length;
-  const generalIssueConfidence = Math.min(100, issueScore * 15);
+  // A lone "?" or "help" is not enough. General needs 5 signals to reach 50%;
+  // crypto needs a keyword plus 2 signals to reach 40%.
+  const generalIssueConfidence = Math.min(100, issueScore * 12);
 
   // Keyword match score
   const lowerKeywords = keywords.map((k) => k.toLowerCase());
@@ -440,7 +451,7 @@ function localClassifyMessage(
   // getting near-zero confidence even for genuine issues that matched a keyword.
   const confidence =
     issueScore > 0 && matchedKeywords.length > 0
-      ? Math.min(100, issueScore * 25)
+      ? Math.min(100, issueScore * 20)
       : 0;
 
   // Crypto detection
@@ -474,59 +485,53 @@ async function aiClassifyMessage(
         messages: [
           {
             role: "system",
-            content: `You are a community support triage system. Your job is to detect any message where a user needs human support attention — whether they are explicitly reporting a problem, asking a question, sounding confused, or simply seeming like they don't know where to start or what to do.
+            content: `You are a careful community support triage system. Score high for a real person who genuinely needs help or has a sincere question related to the project, product, or crypto. Score low for anything unrelated, off-topic, or not actually asking for help. Short, casual, or imperfect questions are fine as long as they are genuine and on-topic.
 
 Return ONLY a JSON object with:
-- confidence: integer 0-100 (keyword topic relevance — only for real questions/problems about that topic)
-- generalIssueConfidence: integer 0-100 (does this person need support attention, for any reason?)
+- confidence: integer 0-100 (is this a real, specific question or problem about the keyword topic / crypto?)
+- generalIssueConfidence: integer 0-100 (is this person genuinely asking for help with a concrete problem or question?)
 - isCrypto: boolean (is this a real crypto-related question or problem)
+- isHelperOrRedirect: boolean (true if the author is offering help, giving advice, or redirecting someone to support/tickets/DMs/links)
 - reasoning: string (brief 1-sentence explanation)
 
-ALWAYS score 0 on BOTH metrics for:
-- Hype, excitement, or bullish statements ("LFG", "to the moon", "this is huge", "wagmi")
-- Announcements, news, or project updates ("just dropped", "new listing", "partnership announced")
-- Memes, GIFs, emojis-only, or joke messages
-- Casual greetings or small talk with no underlying need ("gm", "good morning", "hey guys", "what's up")
-- Price speculation without a question ("$X soon", "100x incoming")
-- Congratulations or cheerleading messages
-- Simple agreement or reactions ("based", "true", "exactly", "same")
-- Bot commands or macros (e.g. !faucet, !work, !help)
-- Spam or promotional content ("i'll help 10k people earn $50k today")
-- ANYONE OFFERING TO HELP OR VOLUNTEERING ASSISTANCE — this is critical. Score 0 even if they ask a question, because their question is asked in order to help someone else, not because they need help themselves. Examples:
-  • "I can help anyone who needs X" / "DM me if you need assistance" / "let me know if you need help"
-  • "anyone need help with X? I've done it before" / "happy to assist"
-  • "what do you need help with?" (asked by someone offering their support)
-  • "I'll walk you through it" / "I can guide you" / "reach out to me"
-  • "I work in support, feel free to ask me"
-  • Questions asked with helper intent: "what's the issue?" / "can you explain what happened?" asked by someone who is trying to assist, not by someone who is lost
+SCORING SCALE:
+- 0-19: no need for help (noise, chat, hype, helpers, redirects, spam, unrelated topics)
+- 20-39: no real ask — bare "help"/"anyone?", small talk, rhetorical remarks, or off-topic questions
+- 40-59: a genuine on-topic question or problem, even if short or casual ("how do i withdraw?", "is claiming down?", "not sure how to stake, where do i start")
+- 60-79: clear question or problem the author has, with some context
+- 80-100: explicit issue (error message, failed/stuck transaction, lost funds, account locked)
 
-Score HIGH (generalIssueConfidence 60-100) for ANY of the following — you do not need an explicit problem report:
+ALWAYS score 0 on BOTH metrics (and set isHelperOrRedirect=true where it applies) for:
+- ANYONE OFFERING HELP, GIVING ADVICE, OR ANSWERING SOMEONE ELSE. Score 0 even if they ask a question, because they ask it to help someone else. Examples:
+  • "I can help" / "DM me" / "let me know if you need help" / "happy to assist" / "reach out to me"
+  • "anyone need help with X? I've done it before" / "I'll walk you through it" / "I work in support"
+  • "what's the issue?" / "can you explain what happened?" asked by someone trying to assist
+  • Answers or instructions: "you need to…", "try clearing your cache", "just reconnect your wallet"
+- ANYONE REDIRECTING OTHERS TO SUPPORT. Examples:
+  • "open a ticket" / "create a support ticket" / "kindly create a ticket in #support"
+  • "ask the team about this" / "contact the mods" / "kindly request support" / "reach out to the admins"
+  • "check the FAQ / docs / pinned message / announcements"
+- Any message containing an obfuscated, masked, shortened, or suspicious link, or asking people to DM/click/connect somewhere
+- Spam, promotions, giveaways, recruitment ("i'll help 10k people earn $50k today")
+- Hype, excitement, bullish/bearish statements ("LFG", "to the moon", "wagmi", "this is huge")
+- Announcements, news, project updates ("just dropped", "new listing", "partnership announced")
+- Memes, GIFs, emojis-only, jokes, sarcasm, rhetorical questions
+- Greetings and small talk ("gm", "hey guys", "what's up", "anyone here?", "how is everyone")
+- Price speculation or opinions without a real question ("$X soon", "100x incoming", "is this going to pump?")
+- Congratulations, cheerleading, agreement, reactions ("based", "true", "same", "lol")
+- Bot commands or macros (!faucet, !work, !help)
 
-1. EXPLICIT ISSUES — errors, bugs, crashes, failed transactions, things not working, account/access problems, complaints about funds.
+Score below 40 on BOTH metrics for:
+- Messages with no actual ask ("help", "anyone?", "hello??", "new here" with nothing else)
+- Questions or chat unrelated to the project, product, or crypto (sports, games, food, personal life, general off-topic chat)
+- General discussion, debate, or opinions that are not asking for help
 
-2. QUESTIONS & UNCERTAINTY — the user is asking something, even if it sounds simple or casual. If they don't know something and are reaching out to find out, that's a support signal.
-   • "how do i…" / "where do i…" / "what is…" / "which one should i…"
-   • "is there a way to…" / "can i…" / "do i need to…"
-   • "when will…" / "why does…" / "what happens if…"
+Score 40+ when BOTH hold:
+1. The author sincerely wants help, an answer, or guidance for themselves — not a joke, hype, a helper, a redirect, or spam.
+2. It relates to the project, product, their account/wallet/funds, or crypto — or the keyword topic.
+Uncertainty counts when it is on-topic ("just joined, how do I get started with staking?").
 
-3. LOST OR DIRECTIONLESS — the user seems unsure what to do, where to go, or how to proceed. They may not even form a proper question.
-   • "i don't know where to start" / "not sure what to do" / "a bit confused"
-   • "just joined, what now?" / "new here" / "i'm lost"
-   • Messages that trail off or feel uncertain even without a clear ask
-
-4. SEEKING HELP OR GUIDANCE — any signal that someone wants a hand, even if politely or indirectly.
-   • "could someone help me?" / "anyone around?" / "any chance someone can explain?"
-   • "struggling with" / "having trouble" / "can't figure out"
-   • Passive requests: "would be great if someone could…" / "hoping to get some help"
-
-5. CASUAL PROBLEM EXPRESSIONS — people rarely describe issues formally. Read between the lines.
-   • "it just keeps loading" / "won't load" / "stuck" / "nothing is happening"
-   • "can't see it" / "not showing up" / "it disappeared"
-   • "tried everything" / "still not working" / "been waiting forever"
-   • "is it down?" / "anyone else having this?" / "it's broken for me"
-   • Frustration, repeated attempts, or resignation implied by phrasing
-
-Use good judgment. Read the whole message holistically — ask yourself: "does this person need someone to talk to them?" If yes, score high. Do not require technical language or a clear statement of a problem. A user saying "not really sure what i'm doing here" deserves the same attention as one saying "i found a bug". Do not penalise vagueness or informality.`,
+Good examples that deserve 60+: "my withdrawal has been pending for 3 hours, tx hash shows success but nothing in my wallet", "I can't connect my wallet, it keeps saying signature rejected", "how do I claim the airdrop? the claim button is greyed out for me".`,
           },
           {
             role: "user",
@@ -539,6 +544,7 @@ Return JSON only.`,
           },
         ],
         response_format: { type: "json_object" },
+        temperature: 0,
         max_completion_tokens: 1000,
       }, {
         // Hard cap — a hung OpenAI request must never stall the per-channel
@@ -552,6 +558,16 @@ Return JSON only.`,
         throw new Error("AI returned empty response");
       }
       const result = JSON.parse(raw);
+      // Helpers and people redirecting to support must never pass, whatever
+      // numeric score the model produced alongside the flag.
+      if (result.isHelperOrRedirect === true) {
+        return {
+          confidence: 0,
+          generalIssueConfidence: 0,
+          isCrypto: false,
+          reasoning: `Helper/redirect: ${String(result.reasoning || "offering help or redirecting to support")}`.substring(0, 200),
+        };
+      }
       return {
         confidence: Math.max(0, Math.min(100, Math.round(Number(result.confidence) || 0))),
         generalIssueConfidence: Math.max(0, Math.min(100, Math.round(Number(result.generalIssueConfidence) || 0))),
