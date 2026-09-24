@@ -1367,10 +1367,24 @@ function openSession(accountId: string, accountName: string, token: string) {
         // where the watchdog/syncSessions could queue an UNCHECKED open while
         // the REST verification was still in flight.
         try {
-          const acc = await storage.getAccount(accountId);
-          if (isFleetActive() && acc?.token) {
+          let acc = await storage.getAccount(accountId);
+          // A token confirmed dead (account marked Disconnected) must never be
+          // reconnected. Also run the fresh REST check promised above: a 401/403
+          // marks the account Disconnected and stops here. A network failure
+          // (null) is not proof of a dead token, so the reconnect proceeds.
+          if (isFleetActive() && acc?.token && acc.status === "Connected") {
+            const valid = await checkAccountToken(acc);
+            if (valid === false) {
+              acc = undefined;
+            } else {
+              acc = await storage.getAccount(accountId);
+            }
+          }
+          if (isFleetActive() && acc?.token && acc.status === "Connected") {
             scheduleGatewayOpen(accountId, accountName, acc.token);
-          } else if (!acc || !acc.token) {
+          } else if (!acc || !acc.token || acc.status !== "Connected") {
+            logFn(`RECONNECT SKIPPED: ${accountName} — token disconnected`);
+            retryCount.delete(accountId);
             pendingResumes.delete(accountId);
             gatewayStatus.delete(accountId);
             gatewayAccountNames.delete(accountId);
@@ -1394,6 +1408,8 @@ function openSession(accountId: string, accountName: string, token: string) {
       );
       storage.updateAccountStatus(accountId, "Disconnected").catch(() => {});
       releaseProxy(accountId);
+      pendingResumes.delete(accountId);
+      retryCount.delete(accountId);
       gatewayStatus.set(accountId, "dead");
     }
   });
@@ -2944,7 +2960,11 @@ async function gatewayWatchdog() {
   try {
     if (!isFleetActive()) return;
     const accounts = await storage.getAccounts();
-    const connected = accounts.filter((a) => !!a.token);
+    // Only accounts still Connected in the DB are eligible for recovery. A
+    // Disconnected account has a confirmed dead token and must never reconnect.
+    const connected = accounts.filter(
+      (a) => !!a.token && a.status === "Connected",
+    );
     const orphans: typeof connected = [];
     for (const acc of connected) {
       const st = gatewayStatus.get(acc.id);
