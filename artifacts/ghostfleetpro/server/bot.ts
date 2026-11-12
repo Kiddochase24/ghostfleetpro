@@ -477,21 +477,29 @@ async function aiClassifyMessage(
 }> {
   const text = messageContent.trim().toLowerCase();
 
-  // 🛑 CREDIT-SAVER PRE-FILTER GUARD: Drop noise, tiny texts, and trivial greetings locally ($0 cost)
+  // 🛑 HEAVY CREDIT-SAVER PRE-FILTER: Block small talk, casual banter, food/dinner, 
+  // personal wellbeing chat, and non-support questions locally for $0.
   if (text.length < 5) {
     return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: text too short", isCrypto: false };
   }
 
-  const trivialPatterns = [
-    /^(gm|gn|hi|hey|hello|sup|yo|wassup|gmall)\b/,
-    /^(how\?|what\?|why\?|who\?|where\?|when\?|how|what|why|hey)$/,
-    /^(lol|lmao|haha|rofl|gg|wow|ok|okay)\b/,
+  const casualChatAndBanterPatterns = [
+    // Greetings / wellbeing / casual check-ins
+    /\b(how are you|what about you|how you doing|what's up|sup|wassup|good evening|good morning|good afternoon)\b/,
+    // Food / dinner / daily life chat
+    /\b(eating for dinner|what's for dinner|food|hungry|lunch|breakfast|dinner|cook|restaurant)\b/,
+    // Casual conversational fillers & rhetorical banter
+    /\b(so what|what is your rank|rank mate|bruh why|what are we)\b/,
+    // Trivial single words or question words alone
+    /^(how\?|what\?|why\?|who\?|where\?|when\?|how|what|why|hey|hi|hello|ok|okay)$/,
+    /^(lol|lmao|haha|rofl|gg|wow|bro|bruh)\b/,
   ];
-  if (trivialPatterns.some((p) => p.test(text))) {
-    return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: trivial or greeting pattern blocked", isCrypto: false };
+
+  if (casualChatAndBanterPatterns.some((p) => p.test(text))) {
+    return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: casual chat / small talk / banter blocked locally", isCrypto: false };
   }
 
-  // Optional Keyword Guard: Ensure message contains at least one target keyword before wasting AI credits
+  // Keyword Guard: Message must contain at least one configured keyword
   if (keywords && keywords.length > 0) {
     const lowerKeywords = keywords.map((k) => k.toLowerCase());
     const hasKeyword = lowerKeywords.some((kw) => text.includes(kw));
@@ -611,7 +619,6 @@ Return JSON only.`,
   logFn(`AI CLASSIFY [local]: crypto=${local.confidence}% general=${local.generalIssueConfidence}% — ${local.reasoning}`);
   return local;
 }
-
 
 // ─── Per-channel send queue — serialises messages with a safety gap ──────────
 // Prevents rate-limit hits when many rules fire on the same channel at once.
