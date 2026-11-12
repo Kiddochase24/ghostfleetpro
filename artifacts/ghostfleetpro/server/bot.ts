@@ -396,7 +396,6 @@ function localClassifyMessage(
   }
 
   // Block people who are OFFERING help — they are helpers, not users in need.
-  // Must run before issue patterns so a helper asking "what's your issue?" isn't caught.
   const offeringHelpPatterns = [
     /\bi can help\b/, /\bi('ll| will) help\b/, /\bi('m| am) here to help\b/,
     /\bhappy to (help|assist)\b/, /\bfeel free to (ask|dm|message) me\b/,
@@ -405,14 +404,12 @@ function localClassifyMessage(
     /\bi('ve| have) (done|been through|dealt with) (this|it|that)\b/,
     /\banyone (who )?needs? (help|assistance|support)\b/,
     /\bi('ll| will) (take care|handle|sort)\b/,
-    // Redirecting others to support channels instead of asking for help
     /\b(open|create|make|raise|submit) an? (support )?ticket\b/,
     /\bkindly (open|create|request|contact|reach)\b/,
     /\bask (the )?(team|mods?|admins?|support|devs?)\b/,
     /\b(contact|reach out to) (the )?(team|mods?|admins?|support|devs?)\b/,
     /\b(check|read) (the )?(faq|docs|pinned|announcements?)\b/,
     /\byou (need|have|should) to\b/, /\btry (clearing|reconnecting|refreshing)\b/,
-    // Masked / shortened links are a scam signal, never a genuine request
     /\[[^\]]*\]\(https?:\/\//, /\b(bit\.ly|tinyurl|t\.co|cutt\.ly|rb\.gy|is\.gd)\//,
   ];
   const isOfferingHelp = offeringHelpPatterns.some((p) => p.test(text));
@@ -429,7 +426,6 @@ function localClassifyMessage(
     /\bwhat\b/, /\bunable\b/, /\bcannot\b/, /\brefund\b/, /\bmissing\b/,
     /\blost\b/, /\bstolen\b/, /\bfrozen\b/, /\blocked\b/, /\bsupport\b/,
     /\bplease\b/, /\btransaction\b/, /\bwallet\b/, /\bwithdraw\b/, /\bdeposit\b/,
-    // Confusion / directionless / uncertainty signals
     /\bnot sure\b/, /\bno idea\b/, /\bdon'?t know\b/, /\bhave no idea\b/,
     /\bnew here\b/, /\bjust joined\b/, /\bwhat do i\b/, /\bwhat should i\b/,
     /\bwhere do i\b/, /\bhow do i\b/, /\bwhere can i\b/, /\bwhat now\b/,
@@ -437,24 +433,16 @@ function localClassifyMessage(
     /\bcan'?t figure\b/, /\bnot really sure\b/, /\bunfamiliar\b/,
   ];
   const issueScore = issuePatterns.filter((p) => p.test(text)).length;
-  // A lone "?" or "help" is not enough. General needs 5 signals to reach 50%;
-  // crypto needs a keyword plus 2 signals to reach 40%.
   const generalIssueConfidence = Math.min(100, issueScore * 12);
 
-  // Keyword match score
   const lowerKeywords = keywords.map((k) => k.toLowerCase());
   const matchedKeywords = lowerKeywords.filter((kw) => text.includes(kw));
-  const keywordScore = matchedKeywords.length / Math.max(1, lowerKeywords.length);
 
-  // Confidence = issue signal strength when ANY keyword matched.
-  // Do NOT divide by total keyword count — rules with long keyword lists were
-  // getting near-zero confidence even for genuine issues that matched a keyword.
   const confidence =
     issueScore > 0 && matchedKeywords.length > 0
       ? Math.min(100, issueScore * 20)
       : 0;
 
-  // Crypto detection
   const cryptoWords = ["crypto", "token", "coin", "wallet", "blockchain", "defi", "nft", "eth", "btc", "sol", "usdt", "usdc", "swap", "dex", "contract", "transaction", "tx"];
   const isCrypto = cryptoWords.some((w) => text.includes(w));
 
@@ -465,7 +453,7 @@ function localClassifyMessage(
   return { confidence, generalIssueConfidence, reasoning, isCrypto };
 }
 
-// ─── AI message classifier — checks if message is a genuine issue ────────────
+// ─── AI message classifier — Balanced Hybrid Cascade ─────────────────────────
 async function aiClassifyMessage(
   messageContent: string,
   keywords: string[],
@@ -477,39 +465,24 @@ async function aiClassifyMessage(
 }> {
   const text = messageContent.trim().toLowerCase();
 
-  // 🛑 HEAVY CREDIT-SAVER PRE-FILTER: Block small talk, casual banter, food/dinner, 
-  // personal wellbeing chat, and non-support questions locally for $0.
-  if (text.length < 5) {
+  // 1. TIER 1: Ultra-lightweight local guard. 
+  // ONLY block 100% dead-giveaway waste (too short, pure emojis, exact greetings/dinner talk).
+  if (text.length < 2) {
     return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: text too short", isCrypto: false };
   }
 
-  const casualChatAndBanterPatterns = [
-    // Greetings / wellbeing / casual check-ins
-    /\b(how are you|what about you|how you doing|what's up|sup|wassup|good evening|good morning|good afternoon)\b/,
-    // Food / dinner / daily life chat
-    /\b(eating for dinner|what's for dinner|food|hungry|lunch|breakfast|dinner|cook|restaurant)\b/,
-    // Casual conversational fillers & rhetorical banter
-    /\b(so what|what is your rank|rank mate|bruh why|what are we)\b/,
-    // Trivial single words or question words alone
-    /^(how\?|what\?|why\?|who\?|where\?|when\?|how|what|why|hey|hi|hello|ok|okay)$/,
-    /^(lol|lmao|haha|rofl|gg|wow|bro|bruh)\b/,
+  const absoluteGarbagePatterns = [
+    /^(gm|gn|hi|hey|hello|sup|yo|wassup)$/,
+    /^(lol|lmao|haha|rofl|gg|wow|ok|okay|bro|bruh)$/,
+    /\b(eating for dinner|what's for dinner)\b/,
   ];
 
-  if (casualChatAndBanterPatterns.some((p) => p.test(text))) {
-    return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: casual chat / small talk / banter blocked locally", isCrypto: false };
+  if (absoluteGarbagePatterns.some((p) => p.test(text))) {
+    return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: absolute garbage/greetings blocked locally", isCrypto: false };
   }
 
-  // Keyword Guard: Message must contain at least one configured keyword
-  if (keywords && keywords.length > 0) {
-    const lowerKeywords = keywords.map((k) => k.toLowerCase());
-    const hasKeyword = lowerKeywords.some((kw) => text.includes(kw));
-    if (!hasKeyword) {
-      return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: missing required keywords", isCrypto: false };
-    }
-  }
-
-  // Try AI first — fall back to local classifier if unavailable.
-  // getOpenAIClient() is evaluated lazily so a key added after startup is picked up.
+  // 2. TIER 2: Send everything else to the Paid AI! 
+  // Let the AI use its intelligence to decide what is a real inquiry vs casual chat.
   const client = getOpenAIClient();
   if (client) {
     try {
@@ -521,50 +494,20 @@ async function aiClassifyMessage(
             content: `You are a careful community support triage system. Score high for a real person who genuinely needs help or has a sincere question related to the project, product, or crypto. Score low for anything unrelated, off-topic, or not actually asking for help. Short, casual, or imperfect questions are fine as long as they are genuine and on-topic.
 
 Return ONLY a JSON object with:
-- confidence: integer 0-100 (is this a real, specific question or problem about the keyword topic / crypto?)
-- generalIssueConfidence: integer 0-100 (is this person genuinely asking for help with a concrete problem or question?)
-- isCrypto: boolean (is this a real crypto-related question or problem)
-- isHelperOrRedirect: boolean (true if the author is offering help, giving advice, or redirecting someone to support/tickets/DMs/links)
-- reasoning: string (brief 1-sentence explanation)
+- confidence: integer 0-100
+- generalIssueConfidence: integer 0-100
+- isCrypto: boolean
+- isHelperOrRedirect: boolean
+- reasoning: string
 
 SCORING SCALE:
-- 0-19: no need for help (noise, chat, hype, helpers, redirects, spam, unrelated topics)
-- 20-39: no real ask — bare "help"/"anyone?", small talk, rhetorical remarks, or off-topic questions
-- 40-59: a genuine on-topic question or problem, even if short or casual ("how do i withdraw?", "is claiming down?", "not sure how to stake, where do i start")
+- 0-19: no need for help (noise, chat, hype, helpers, redirects, spam, unrelated topics, casual small talk like "how are you", "what is your rank")
+- 20-39: no real ask — bare "help"/"anyone?", small talk, rhetorical remarks
+- 40-59: a genuine on-topic question or problem, even if short or casual ("how do i withdraw?", "is claiming down?")
 - 60-79: clear question or problem the author has, with some context
-- 80-100: explicit issue (error message, failed/stuck transaction, lost funds, account locked)
+- 80-100: explicit issue (error message, failed/stuck transaction, lost funds)
 
-ALWAYS score 0 on BOTH metrics (and set isHelperOrRedirect=true where it applies) for:
-- ANYONE OFFERING HELP, GIVING ADVICE, OR ANSWERING SOMEONE ELSE. Score 0 even if they ask a question, because they ask it to help someone else. Examples:
-  • "I can help" / "DM me" / "let me know if you need help" / "happy to assist" / "reach out to me"
-  • "anyone need help with X? I've done it before" / "I'll walk you through it" / "I work in support"
-  • "what's the issue?" / "can you explain what happened?" asked by someone trying to assist
-  • Answers or instructions: "you need to…", "try clearing your cache", "just reconnect your wallet"
-- ANYONE REDIRECTING OTHERS TO SUPPORT. Examples:
-  • "open a ticket" / "create a support ticket" / "kindly create a ticket in #support"
-  • "ask the team about this" / "contact the mods" / "kindly request support" / "reach out to the admins"
-  • "check the FAQ / docs / pinned message / announcements"
-- Any message containing an obfuscated, masked, shortened, or suspicious link, or asking people to DM/click/connect somewhere
-- Spam, promotions, giveaways, recruitment ("i'll help 10k people earn $50k today")
-- Hype, excitement, bullish/bearish statements ("LFG", "to the moon", "wagmi", "this is huge")
-- Announcements, news, project updates ("just dropped", "new listing", "partnership announced")
-- Memes, GIFs, emojis-only, jokes, sarcasm, rhetorical questions
-- Greetings and small talk ("gm", "hey guys", "what's up", "anyone here?", "how is everyone")
-- Price speculation or opinions without a real question ("$X soon", "100x incoming", "is this going to pump?")
-- Congratulations, cheerleading, agreement, reactions ("based", "true", "same", "lol")
-- Bot commands or macros (!faucet, !work, !help)
-
-Score below 40 on BOTH metrics for:
-- Messages with no actual ask ("help", "anyone?", "hello??", "new here" with nothing else)
-- Questions or chat unrelated to the project, product, or crypto (sports, games, food, personal life, general off-topic chat)
-- General discussion, debate, or opinions that are not asking for help
-
-Score 40+ when BOTH hold:
-1. The author sincerely wants help, an answer, or guidance for themselves — not a joke, hype, a helper, a redirect, or spam.
- 2. It relates to the project, product, their account/wallet/funds, or crypto — or the keyword topic.
-Uncertainty counts when it is on-topic ("just joined, how do I get started with staking?").
-
-Good examples that deserve 60+: "my withdrawal has been pending for 3 hours, tx hash shows success but nothing in my wallet", "I can't connect my wallet, it keeps saying signature rejected", "how do I claim the airdrop? the claim button is greyed out for me".`,
+ALWAYS score 0 on BOTH metrics (and set isHelperOrRedirect=true) for helpers, support redirectors, spam, hype, greetings, and casual off-topic banter.`,
           },
           {
             role: "user",
@@ -580,8 +523,6 @@ Return JSON only.`,
         temperature: 0,
         max_completion_tokens: 1000,
       }, {
-        // Hard cap — a hung OpenAI request must never stall the per-channel
-        // send queue (which serialises every reply for that channel).
         timeout: 15_000,
         maxRetries: 0,
       });
@@ -591,14 +532,12 @@ Return JSON only.`,
         throw new Error("AI returned empty response");
       }
       const result = JSON.parse(raw);
-      // Helpers and people redirecting to support must never pass, whatever
-      // numeric score the model produced alongside the flag.
       if (result.isHelperOrRedirect === true) {
         return {
           confidence: 0,
           generalIssueConfidence: 0,
           isCrypto: false,
-          reasoning: `Helper/redirect: ${String(result.reasoning || "offering help or redirecting to support")}`.substring(0, 200),
+          reasoning: `Helper/redirect: ${String(result.reasoning || "offering help")}`.substring(0, 200),
         };
       }
       return {
@@ -608,17 +547,16 @@ Return JSON only.`,
         reasoning: String(result.reasoning || "No reasoning provided").substring(0, 200),
       };
     } catch (e: any) {
-      // Always log the real error so pm2 logs show exactly why AI failed.
-      // Previously 404s were swallowed silently — that hid key/model mismatches on the VPS.
       logFn(`AI CLASSIFY ERR: ${e.message ?? String(e)} — falling back to local classifier`);
     }
   }
 
-  // Local classifier fallback
+  // 3. TIER 3: Fallback to local classifier ONLY if OpenAI API fails or is out of credits
   const local = localClassifyMessage(messageContent, keywords);
-  logFn(`AI CLASSIFY [local]: crypto=${local.confidence}% general=${local.generalIssueConfidence}% — ${local.reasoning}`);
+  logFn(`AI CLASSIFY [local fallback]: crypto=${local.confidence}% general=${local.generalIssueConfidence}% — ${local.reasoning}`);
   return local;
 }
+
 
 // ─── Per-channel send queue — serialises messages with a safety gap ──────────
 // Prevents rate-limit hits when many rules fire on the same channel at once.
