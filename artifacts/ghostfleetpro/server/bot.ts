@@ -467,7 +467,7 @@ async function aiClassifyMessage(
 
   // 1. TIER 1: Ultra-lightweight local guard. 
   // ONLY block 100% dead-giveaway waste (too short, pure emojis, exact greetings/dinner talk).
-  if (text.length < 2) {
+  if (text.length < 4) {
     return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: text too short", isCrypto: false };
   }
 
