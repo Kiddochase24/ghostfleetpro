@@ -453,7 +453,7 @@ function localClassifyMessage(
   return { confidence, generalIssueConfidence, reasoning, isCrypto };
 }
 
-// ─── AI message classifier — Balanced Hybrid Cascade ─────────────────────────
+// ─── AI message classifier — checks if message is a genuine issue ────────────
 async function aiClassifyMessage(
   messageContent: string,
   keywords: string[],
@@ -465,8 +465,7 @@ async function aiClassifyMessage(
 }> {
   const text = messageContent.trim().toLowerCase();
 
-  // 1. TIER 1: Ultra-lightweight local guard. 
-  // ONLY block 100% dead-giveaway waste (too short, pure emojis, exact greetings/dinner talk).
+  // 1. TIER 1: Ultra-light local guard for 100% absolute garbage/greetings ($0 cost)
   if (text.length < 4) {
     return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: text too short", isCrypto: false };
   }
@@ -481,8 +480,7 @@ async function aiClassifyMessage(
     return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: absolute garbage/greetings blocked locally", isCrypto: false };
   }
 
-  // 2. TIER 2: Send everything else to the Paid AI! 
-  // Let the AI use its intelligence to decide what is a real inquiry vs casual chat.
+  // 2. TIER 2: Send everything else to Paid AI using your exact full system instructions
   const client = getOpenAIClient();
   if (client) {
     try {
@@ -494,20 +492,50 @@ async function aiClassifyMessage(
             content: `You are a careful community support triage system. Score high for a real person who genuinely needs help or has a sincere question related to the project, product, or crypto. Score low for anything unrelated, off-topic, or not actually asking for help. Short, casual, or imperfect questions are fine as long as they are genuine and on-topic.
 
 Return ONLY a JSON object with:
-- confidence: integer 0-100
-- generalIssueConfidence: integer 0-100
-- isCrypto: boolean
-- isHelperOrRedirect: boolean
-- reasoning: string
+- confidence: integer 0-100 (is this a real, specific question or problem about the keyword topic / crypto?)
+- generalIssueConfidence: integer 0-100 (is this person genuinely asking for help with a concrete problem or question?)
+- isCrypto: boolean (is this a real crypto-related question or problem)
+- isHelperOrRedirect: boolean (true if the author is offering help, giving advice, or redirecting someone to support/tickets/DMs/links)
+- reasoning: string (brief 1-sentence explanation)
 
 SCORING SCALE:
-- 0-19: no need for help (noise, chat, hype, helpers, redirects, spam, unrelated topics, casual small talk like "how are you", "what is your rank")
-- 20-39: no real ask — bare "help"/"anyone?", small talk, rhetorical remarks
-- 40-59: a genuine on-topic question or problem, even if short or casual ("how do i withdraw?", "is claiming down?")
+- 0-19: no need for help (noise, chat, hype, helpers, redirects, spam, unrelated topics, rhetorical/curious questions like "why didn't you participate?")
+- 20-39: no real ask — bare "help"/"anyone?", small talk, rhetorical remarks, or off-topic questions
+- 40-59: a genuine on-topic question or problem, even if short or casual ("how do i withdraw?", "is claiming down?", "not sure how to stake, where do i start")
 - 60-79: clear question or problem the author has, with some context
-- 80-100: explicit issue (error message, failed/stuck transaction, lost funds)
+- 80-100: explicit issue (error message, failed/stuck transaction, lost funds, account locked)
 
-ALWAYS score 0 on BOTH metrics (and set isHelperOrRedirect=true) for helpers, support redirectors, spam, hype, greetings, and casual off-topic banter.`,
+ALWAYS score 0 on BOTH metrics (and set isHelperOrRedirect=true where it applies) for:
+- ANYONE OFFERING HELP, GIVING ADVICE, OR ANSWERING SOMEONE ELSE. Score 0 even if they ask a question, because they ask it to help someone else. Examples:
+  • "I can help" / "DM me" / "let me know if you need help" / "happy to assist" / "reach out to me"
+  • "anyone need help with X? I've done it before" / "I'll walk you through it" / "I work in support"
+  • "what's the issue?" / "can you explain what happened?" asked by someone trying to assist
+  • Answers or instructions: "you need to…", "try clearing your cache", "just reconnect your wallet"
+- ANYONE REDIRECTING OTHERS TO SUPPORT. Examples:
+  • "open a ticket" / "create a support ticket" / "kindly create a ticket in #support"
+  • "ask the team about this" / "contact the mods" / "kindly request support" / "reach out to the admins"
+  • "check the FAQ / docs / pinned message / announcements"
+- Any message containing an obfuscated, masked, shortened, or suspicious link, or asking people to DM/click/connect somewhere
+- Spam, promotions, giveaways, recruitment ("i'll help 10k people earn $50k today")
+- Hype, excitement, bullish/bearish statements ("LFG", "to the moon", "wagmi", "this is huge")
+- Announcements, news, project updates ("just dropped", "new listing", "partnership announced")
+- Memes, GIFs, emojis-only, jokes, sarcasm, rhetorical questions (including rhetorical "why" questions like "why didn't you participate?")
+- Greetings and small talk ("gm", "hey guys", "what's up", "anyone here?", "how is everyone")
+- Price speculation or opinions without a real question ("$X soon", "100x incoming", "is this going to pump?")
+- Congratulations, cheerleading, agreement, reactions ("based", "true", "same", "lol")
+- Bot commands or macros (!faucet, !work, !help)
+
+Score below 40 on BOTH metrics for:
+- Messages with no actual ask ("help", "anyone?", "hello??", "new here" with nothing else)
+- Questions or chat unrelated to the project, product, or crypto (sports, games, food, personal life, general off-topic chat)
+- General discussion, debate, or opinions that are not asking for help
+
+Score 40+ when BOTH hold:
+1. The author sincerely wants help, an answer, or guidance for themselves — not a joke, hype, a helper, a redirect, or spam.
+2. It relates to the project, product, their account/wallet/funds, or crypto — or the keyword topic.
+Uncertainty counts when it is on-topic ("just joined, how do I get started with staking?").
+
+Good examples that deserve 60+: "my withdrawal has been pending for 3 hours, tx hash shows success but nothing in my wallet", "I can't connect my wallet, it keeps saying signature rejected", "how do I claim the airdrop? the claim button is greyed out for me".`,
           },
           {
             role: "user",
@@ -537,7 +565,7 @@ Return JSON only.`,
           confidence: 0,
           generalIssueConfidence: 0,
           isCrypto: false,
-          reasoning: `Helper/redirect: ${String(result.reasoning || "offering help")}`.substring(0, 200),
+          reasoning: `Helper/redirect: ${String(result.reasoning || "offering help or redirecting to support")}`.substring(0, 200),
         };
       }
       return {
@@ -551,7 +579,7 @@ Return JSON only.`,
     }
   }
 
-  // 3. TIER 3: Fallback to local classifier ONLY if OpenAI API fails or is out of credits
+  // 3. TIER 3: Local classifier fallback
   const local = localClassifyMessage(messageContent, keywords);
   logFn(`AI CLASSIFY [local fallback]: crypto=${local.confidence}% general=${local.generalIssueConfidence}% — ${local.reasoning}`);
   return local;
