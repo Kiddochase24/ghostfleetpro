@@ -475,6 +475,31 @@ async function aiClassifyMessage(
   reasoning: string;
   isCrypto: boolean;
 }> {
+  const text = messageContent.trim().toLowerCase();
+
+  // 🛑 CREDIT-SAVER PRE-FILTER GUARD: Drop noise, tiny texts, and trivial greetings locally ($0 cost)
+  if (text.length < 5) {
+    return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: text too short", isCrypto: false };
+  }
+
+  const trivialPatterns = [
+    /^(gm|gn|hi|hey|hello|sup|yo|wassup|gmall)\b/,
+    /^(how\?|what\?|why\?|who\?|where\?|when\?|how|what|why|hey)$/,
+    /^(lol|lmao|haha|rofl|gg|wow|ok|okay)\b/,
+  ];
+  if (trivialPatterns.some((p) => p.test(text))) {
+    return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: trivial or greeting pattern blocked", isCrypto: false };
+  }
+
+  // Optional Keyword Guard: Ensure message contains at least one target keyword before wasting AI credits
+  if (keywords && keywords.length > 0) {
+    const lowerKeywords = keywords.map((k) => k.toLowerCase());
+    const hasKeyword = lowerKeywords.some((kw) => text.includes(kw));
+    if (!hasKeyword) {
+      return { confidence: 0, generalIssueConfidence: 0, reasoning: "Pre-filter: missing required keywords", isCrypto: false };
+    }
+  }
+
   // Try AI first — fall back to local classifier if unavailable.
   // getOpenAIClient() is evaluated lazily so a key added after startup is picked up.
   const client = getOpenAIClient();
@@ -528,7 +553,7 @@ Score below 40 on BOTH metrics for:
 
 Score 40+ when BOTH hold:
 1. The author sincerely wants help, an answer, or guidance for themselves — not a joke, hype, a helper, a redirect, or spam.
-2. It relates to the project, product, their account/wallet/funds, or crypto — or the keyword topic.
+ 2. It relates to the project, product, their account/wallet/funds, or crypto — or the keyword topic.
 Uncertainty counts when it is on-topic ("just joined, how do I get started with staking?").
 
 Good examples that deserve 60+: "my withdrawal has been pending for 3 hours, tx hash shows success but nothing in my wallet", "I can't connect my wallet, it keeps saying signature rejected", "how do I claim the airdrop? the claim button is greyed out for me".`,
